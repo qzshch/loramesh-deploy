@@ -280,10 +280,20 @@ fi
 info "Step 5/9: Stopping native packet forwarder (SPI holder)..."
 if [ -f "/etc/init.d/lora_pkt_fwd" ]; then
   /etc/init.d/lora_pkt_fwd stop 2>/dev/null && info "  Stopped lora_pkt_fwd" || true
+  /etc/init.d/lora_pkt_fwd disable 2>/dev/null && info "  Disabled lora_pkt_fwd auto-start" || true
 fi
 killall -9 lora_pkt_fwd station 2>/dev/null || true
 # Keep NS services running: loraserver, lora_app_server, lora_gateway_bridge, postgres
 sleep 2
+
+# Install lora_pkt_fwd watchdog via cron — kills native pkt_fwd if re-enabled while mesh runs
+info "  Installing lora_pkt_fwd watchdog (cron, every 1 min)..."
+WATCHDOG_CRON='* * * * * [ -f /tmp/.mesh_container_running ] && pgrep -x lora_pkt_fwd >/dev/null && { /etc/init.d/lora_pkt_fwd stop; killall -9 lora_pkt_fwd; } 2>/dev/null'
+(crontab -l 2>/dev/null | grep -v mesh_container_running; echo "$WATCHDOG_CRON") | crontab -
+/etc/init.d/cron enable 2>/dev/null
+/etc/init.d/cron restart 2>/dev/null
+touch /tmp/.mesh_container_running
+info "  lora_pkt_fwd watchdog installed"
 
 # ── Step 6: Initialize GPIO ──
 

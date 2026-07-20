@@ -53,6 +53,18 @@ rm -f /tmp/mesh_deploy.sh /tmp/mesh_deploy.log 2>/dev/null
 # ── Step 4: Restart native packet forwarder ──
 info "Step 4/4: Restoring native packet forwarder..."
 RESTARTED=0
+
+# Stop and remove pkt_fwd watchdog
+if [ -f "/etc/init.d/mesh_pkt_fwd_guard" ]; then
+    /etc/init.d/mesh_pkt_fwd_guard stop 2>/dev/null
+    /etc/init.d/mesh_pkt_fwd_guard disable 2>/dev/null
+    rm -f /etc/init.d/mesh_pkt_fwd_guard
+    info "  Removed lora_pkt_fwd watchdog"
+fi
+# Remove cron watchdog
+(crontab -l 2>/dev/null | grep -v mesh_container_running) | crontab -
+rm -f /tmp/.mesh_container_running
+
 if [ -f "/etc/init.d/lora_pkt_fwd" ]; then
     # Unexport GPIOs first (container may have left them exported)
     for GPIO_DIR in /sys/class/gpio/gpio*; do
@@ -63,6 +75,7 @@ if [ -f "/etc/init.d/lora_pkt_fwd" ]; then
       echo "$NUM" | grep -q '^[0-9][0-9]*$' || continue
       echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
     done
+    /etc/init.d/lora_pkt_fwd enable 2>/dev/null
     /etc/init.d/lora_pkt_fwd start 2>/dev/null && info "  Started lora_pkt_fwd" && RESTARTED=1
 fi
 [ "$RESTARTED" -eq 0 ] && warn "  No native packet forwarder service found"
