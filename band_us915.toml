@@ -1,0 +1,74 @@
+
+[mappings]
+# US915 uplink channels: sub-band 0 (8ch × 125kHz) + 500kHz
+channels=[
+  902300000,
+  902500000,
+  902700000,
+  902900000,
+  903100000,
+  903300000,
+  903500000,
+  903700000,
+  903000000,
+]
+tx_power=[
+  30,
+  28,
+  26,
+  24,
+  22,
+  20,
+  18,
+  16,
+  14,
+  12,
+  10,
+  8,
+  6,
+  4,
+  2,
+  0,
+]
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=10
+  bandwidth=125000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=9
+  bandwidth=125000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=8
+  bandwidth=125000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=7
+  bandwidth=125000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=8
+  bandwidth=500000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=12
+  bandwidth=500000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=11
+  bandwidth=500000
+  code_rate="4/5"

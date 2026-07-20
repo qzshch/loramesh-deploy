@@ -1,0 +1,64 @@
+
+[mappings]
+channels=[
+  917300000,
+  917500000,
+  917700000,
+  917900000,
+  918100000,
+  918300000,
+  918500000,
+  918700000,
+]
+tx_power=[
+  19,
+  17,
+  15,
+  13,
+  11,
+  9,
+  7,
+  5,
+]
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=12
+  bandwidth=125000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=11
+  bandwidth=125000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=10
+  bandwidth=125000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=9
+  bandwidth=125000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=8
+  bandwidth=125000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=7
+  bandwidth=125000
+  code_rate="4/5"
+
+  [[mappings.data_rates]]
+  modulation="LORA"
+  spreading_factor=7
+  bandwidth=250000
+  code_rate="4/5"
