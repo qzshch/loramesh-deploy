@@ -114,7 +114,7 @@ index 3bc808a..ebf3474 100644
  
      /* Set Bitrate to maximum (to lower TX to FS switch time) */
 diff --git a/libloragw/src/loragw_sx1302.c b/libloragw/src/loragw_sx1302.c
-index aa330cd..11239cb 100644
+index aa330cd..40520a7 100644
 --- a/libloragw/src/loragw_sx1302.c
 +++ b/libloragw/src/loragw_sx1302.c
 @@ -328,6 +328,57 @@ int sx1302_get_model_id(sx1302_model_id_t * model_id) {
@@ -161,7 +161,7 @@ index aa330cd..11239cb 100644
 +    if (err == LGW_REG_SUCCESS) {
 +        printf("INFO: SX1302 model ID: 0x%02X (%s)\n",
 +               (uint8_t)model_id,
-+               (model_id == SX1302_CHIP_MODEL_ID_SX1303) ? "SX1303" : "SX1302");
++               (model_id == CHIP_MODEL_ID_SX1303) ? "SX1303" : "SX1302");
 +    } else {
 +        printf("WARNING: failed to read SX1302 model ID\n");
 +    }
