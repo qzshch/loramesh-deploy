@@ -1,0 +1,177 @@
+diff --git a/libloragw/inc/loragw_sx1302.h b/libloragw/inc/loragw_sx1302.h
+index 9751621..21cb8b7 100644
+--- a/libloragw/inc/loragw_sx1302.h
++++ b/libloragw/inc/loragw_sx1302.h
+@@ -111,6 +111,13 @@ int sx1302_get_eui(uint64_t * eui);
+ */
+ int sx1302_get_model_id(sx1302_model_id_t * model_id);
+ 
++/**
++@brief Read and print SX1302 board diagnostic info (chip version, GPIO inputs, model ID)
++@param N/A
++@return LGW_REG_SUCCESS if no error, LGW_REG_ERROR otherwise
++*/
++int sx1302_read_board_info(void);
++
+ /**
+ @brief Check AGC & ARB MCUs parity error, and update timestamp counter wraping status
+ @brief This function needs to be called regularly (every few seconds) by the upper layer
+diff --git a/libloragw/src/loragw_hal.c b/libloragw/src/loragw_hal.c
+index 2587208..d603078 100644
+--- a/libloragw/src/loragw_hal.c
++++ b/libloragw/src/loragw_hal.c
+@@ -879,6 +879,9 @@ int lgw_start(void) {
+         return LGW_HAL_ERROR;
+     }
+ 
++    /* Read board diagnostic info (before radio calibration changes state) */
++    sx1302_read_board_info();
++
+     /* Calibrate radios */
+     err = sx1302_radio_calibrate(&CONTEXT_RF_CHAIN[0], CONTEXT_BOARD.clksrc, &CONTEXT_TX_GAIN_LUT[0]);
+     if (err != LGW_REG_SUCCESS) {
+diff --git a/libloragw/src/loragw_sx1250.c b/libloragw/src/loragw_sx1250.c
+index 3bc808a..ebf3474 100644
+--- a/libloragw/src/loragw_sx1250.c
++++ b/libloragw/src/loragw_sx1250.c
+@@ -140,17 +140,28 @@ int sx1250_setup(uint8_t rf_chain, uint32_t freq_hz, bool single_input_mode) {
+     uint8_t buff[16];
+     int err = LGW_REG_SUCCESS;
+ 
+-    /* Set Radio in Standby for calibrations */
+-    buff[0] = (uint8_t)STDBY_RC;
+-    err |= sx1250_reg_w(SET_STANDBY, buff, 1, rf_chain);
+-    wait_ms(10);
+-
+-    /* Get status to check Standby mode has been properly set */
+-    buff[0] = 0x00;
+-    err |= sx1250_reg_r(GET_STATUS, buff, 1, rf_chain);
+-    if ((uint8_t)(TAKE_N_BITS_FROM(buff[0], 4, 3)) != 0x02) {
+-        printf("ERROR: Failed to set SX1250_%u in STANDBY_RC mode\n", rf_chain);
+-        return LGW_REG_ERROR;
++    /* Set Radio in Standby for calibrations — with retry for slow-starting boards */
++    {
++        int retry;
++        for (retry = 0; retry < 5; retry++) {
++            buff[0] = (uint8_t)STDBY_RC;
++            err |= sx1250_reg_w(SET_STANDBY, buff, 1, rf_chain);
++            wait_ms(50 + retry * 50); /* 50ms, 100ms, 150ms, 200ms, 250ms */
++
++            /* Get status to check Standby mode has been properly set */
++            buff[0] = 0x00;
++            err |= sx1250_reg_r(GET_STATUS, buff, 1, rf_chain);
++            printf("INFO: SX1250_%u STANDBY_RC attempt %d: status=0x%02X (mode=%u)\n",
++                   rf_chain, retry + 1, buff[0], (uint8_t)(TAKE_N_BITS_FROM(buff[0], 4, 3)));
++            if ((uint8_t)(TAKE_N_BITS_FROM(buff[0], 4, 3)) == 0x02) {
++                break; /* Success */
++            }
++        }
++        if (retry >= 5) {
++            printf("ERROR: Failed to set SX1250_%u in STANDBY_RC mode after %d attempts (last status=0x%02X)\n",
++                   rf_chain, retry, buff[0]);
++            return LGW_REG_ERROR;
++        }
+     }
+ 
+     /* Run all calibrations (TCXO) */
+@@ -158,17 +169,27 @@ int sx1250_setup(uint8_t rf_chain, uint32_t freq_hz, bool single_input_mode) {
+     err |= sx1250_reg_w(CALIBRATE, buff, 1, rf_chain);
+     wait_ms(10);
+ 
+-    /* Set Radio in Standby with XOSC ON */
+-    buff[0] = (uint8_t)STDBY_XOSC;
+-    err |= sx1250_reg_w(SET_STANDBY, buff, 1, rf_chain);
+-    wait_ms(10);
+-
+-    /* Get status to check Standby mode has been properly set */
+-    buff[0] = 0x00;
+-    err |= sx1250_reg_r(GET_STATUS, buff, 1, rf_chain);
+-    if ((uint8_t)(TAKE_N_BITS_FROM(buff[0], 4, 3)) != 0x03) {
+-        printf("ERROR: Failed to set SX1250_%u in STANDBY_XOSC mode\n", rf_chain);
+-        return LGW_REG_ERROR;
++    /* Set Radio in Standby with XOSC ON — with retry */
++    {
++        int retry;
++        for (retry = 0; retry < 5; retry++) {
++            buff[0] = (uint8_t)STDBY_XOSC;
++            err |= sx1250_reg_w(SET_STANDBY, buff, 1, rf_chain);
++            wait_ms(50 + retry * 50);
++
++            buff[0] = 0x00;
++            err |= sx1250_reg_r(GET_STATUS, buff, 1, rf_chain);
++            printf("INFO: SX1250_%u STANDBY_XOSC attempt %d: status=0x%02X (mode=%u)\n",
++                   rf_chain, retry + 1, buff[0], (uint8_t)(TAKE_N_BITS_FROM(buff[0], 4, 3)));
++            if ((uint8_t)(TAKE_N_BITS_FROM(buff[0], 4, 3)) == 0x03) {
++                break;
++            }
++        }
++        if (retry >= 5) {
++            printf("ERROR: Failed to set SX1250_%u in STANDBY_XOSC mode after %d attempts (last status=0x%02X)\n",
++                   rf_chain, retry, buff[0]);
++            return LGW_REG_ERROR;
++        }
+     }
+ 
+     /* Set Bitrate to maximum (to lower TX to FS switch time) */
+diff --git a/libloragw/src/loragw_sx1302.c b/libloragw/src/loragw_sx1302.c
+index aa330cd..11239cb 100644
+--- a/libloragw/src/loragw_sx1302.c
++++ b/libloragw/src/loragw_sx1302.c
+@@ -328,6 +328,57 @@ int sx1302_get_model_id(sx1302_model_id_t * model_id) {
+ 
+ /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+ 
++int sx1302_read_board_info(void) {
++    int err;
++    int32_t val;
++    uint8_t chip_version;
++    uint8_t gpio_in_h, gpio_in_l;
++    sx1302_model_id_t model_id;
++
++    printf("INFO: === SX1302 Board Diagnostics ===\n");
++
++    /* Read chip version (register 0x5606) */
++    err = lgw_reg_r(SX1302_REG_COMMON_VERSION_VERSION, &val);
++    if (err == LGW_REG_SUCCESS) {
++        chip_version = (uint8_t)val;
++        printf("INFO: SX1302 chip version: 0x%02X (v%u.%u)\n",
++               chip_version, (chip_version >> 4) & 0x0F, chip_version & 0x0F);
++    } else {
++        printf("WARNING: failed to read SX1302 chip version\n");
++    }
++
++    /* Read GPIO input values (before sx1302_config_gpio reconfigures them) */
++    err = lgw_reg_r(SX1302_REG_GPIO_GPIO_IN_H_IN_VALUE, &val);
++    if (err == LGW_REG_SUCCESS) {
++        gpio_in_h = (uint8_t)val;
++    } else {
++        gpio_in_h = 0xFF;
++    }
++    err = lgw_reg_r(SX1302_REG_GPIO_GPIO_IN_L_IN_VALUE, &val);
++    if (err == LGW_REG_SUCCESS) {
++        gpio_in_l = (uint8_t)val;
++    } else {
++        gpio_in_l = 0xFF;
++    }
++    printf("INFO: SX1302 GPIO input: H=0x%02X L=0x%02X (combined=0x%04X)\n",
++           gpio_in_h, gpio_in_l, ((uint16_t)gpio_in_h << 8) | gpio_in_l);
++
++    /* Read model ID from OTP */
++    err = sx1302_get_model_id(&model_id);
++    if (err == LGW_REG_SUCCESS) {
++        printf("INFO: SX1302 model ID: 0x%02X (%s)\n",
++               (uint8_t)model_id,
++               (model_id == SX1302_CHIP_MODEL_ID_SX1303) ? "SX1303" : "SX1302");
++    } else {
++        printf("WARNING: failed to read SX1302 model ID\n");
++    }
++
++    printf("INFO: === End Board Diagnostics ===\n");
++    return LGW_REG_SUCCESS;
++}
++
++/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
++
+ int sx1302_update(void) {
+     uint32_t inst, pps;
+     /* performances variables */
