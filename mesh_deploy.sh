@@ -272,11 +272,14 @@ case "$PRODUCT" in
     ;;
 esac
 
-# Docker env RESET_GPIO=0 prevents concentratord from using the wrong GPIO chip
-# on initial startup. Fix 1d (below) injects the correct chip+pin into TOML
-# and restarts concentratord with proper GPIO configuration.
-SX1302_RESET_GPIO_DOCKER=0
-info "Product=$PRODUCT, Band=${GW_BAND}MHz, Reset: ${GPIO_CHIP_DEV} pin ${SX1302_RESET_GPIO}"
+# Override: use RESET_GPIO=0 for all models (Bug #49)
+# concentratord's cdev reset leaves the GPIO LOW after reset. On Milesight gateways,
+# LOW on the SX1302 reset pin keeps the chip in reset → lgw_send fails, TX never works.
+# Fix: set RESET_GPIO=0 so concentratord falls back to its hardcoded pin 17
+# (harmless unused GPIO on all Milesight models). The real SX1302 hardware reset
+# is handled externally by reset_lgw.sh (Step 6) which correctly sets the pin HIGH.
+SX1302_RESET_GPIO=0
+info "Product=$PRODUCT, Band=${GW_BAND}MHz"
 
 # UG56: download prerequisite files if missing
 if [ "$PRODUCT" = "56" ]; then
@@ -385,7 +388,7 @@ else
     -e REGION=${TMP_REGION} \
     -e CHANNELS=${TMP_CHANNELS} \
     -e HAS_GPS=0 \
-    -e RESET_GPIO=${SX1302_RESET_GPIO_DOCKER} \
+    -e RESET_GPIO=${SX1302_RESET_GPIO} \
     ${IMAGE_NAME} >/dev/null 2>&1
 
   GATEWAY_EUI=""
@@ -599,36 +602,10 @@ supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
 EOF
 ' && info "    supervisorctl enabled" || error "Fix 1c failed: supervisorctl sections"
 
-# Fix 1d: Override SX1302 reset pin in concentratord.toml
-# The rak_2287 model config hardcodes pin 17, but Milesight gateways use
-# different reset pins. The Docker device mapping already maps the correct
-# host gpiochip to /dev/gpiochip0 inside the container, so we only need
-# to override the pin number.
-# Skip for UG56: it uses a custom sysfs-based concentratord binary.
-if [ "$PRODUCT" != "56" ]; then
-  info "  Overriding SX1302 reset pin to ${SX1302_RESET_GPIO} (model default: 17)..."
-  $DOCKER_BIN exec ${CONTAINER_NAME} sh -c "
-    # Remove any existing reset pin override
-    sed -i '/sx1302_reset_pin/d' /opt/chirpstack/concentratord.toml
-    # Inject correct pin number after model_flags line
-    sed -i '/model_flags/a sx1302_reset_pin=${SX1302_RESET_GPIO}' /opt/chirpstack/concentratord.toml
-  " && info "    sx1302_reset_pin=${SX1302_RESET_GPIO} injected" \
-     || error "Fix 1d failed: TOML injection"
-
-  # Restart concentratord to pick up the new config
-  # Wait for supervisord socket to be ready first
-  for i in $(seq 1 10); do
-    if $DOCKER_BIN exec ${CONTAINER_NAME} test -S /var/run/supervisor.sock 2>/dev/null; then
-      break
-    fi
-    sleep 1
-  done
-  $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl restart concentratord 2>/dev/null
-  sleep 3
-  info "    concentratord restarted with correct reset pin"
-else
-  info "  Skipping Fix 1d (UG56 uses sysfs-based concentratord)"
-fi
+# Fix 1d: No-op — RESET_GPIO=0 (set below) already prevents concentratord from
+# using the real SX1302 reset pin. The rak_2287 model default (pin 17) is a
+# harmless unconnected GPIO on all Milesight models. The real SX1302 hardware
+# reset is done externally by reset_lgw.sh (Step 6). See Bug #49 for details.
 
 # Fix 2: Python stdout buffering — add PYTHONUNBUFFERED to supervisord
 # Without this, gateway-mesh and forwarder produce NO log output in Docker
