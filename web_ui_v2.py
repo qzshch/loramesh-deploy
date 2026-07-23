@@ -126,6 +126,48 @@ MQTT_CONFIG_PATH = "/opt/chirpstack/mqtt_forwarder.toml"
 CONCENTRATORD_CONFIG_PATH = "/opt/chirpstack/concentratord.toml"
 CONFIGS_DIR = "/opt/chirpstack/configs/chirpstack-concentratord-sx1302"
 IS_BORDER = os.environ.get("RELAY_BORDER", "false") == "true"
+
+DOCKER_BRIDGE_IP = "172.17.0.1"
+
+def detect_local_ns():
+    """Detect if built-in NS (LGB) is running on host.
+    Sends a Semtech UDP STAT packet to LGB port 1700 on Docker bridge.
+    Returns True if LGB responds, indicating local NS is available.
+
+    IMPORTANT: Built-in NS always uses Semtech UDP path (not mqtt-forwarder),
+    because ChirpStack v4 mqtt-forwarder uses MQTT v5 which is incompatible
+    with gateway mosquitto v1.4.x (only supports v3.1.1).
+    """
+    import socket as _sock
+    try:
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        s.settimeout(2)
+        # Semtech UDP PUSH_DATA: protocol=2, random token, identifier=0 (PUSH_DATA), gateway ID
+        stat_pkt = b'\x02\x00\x00\x00' + b'\x00' * 8
+        s.sendto(stat_pkt, (DOCKER_BRIDGE_IP, 1700))
+        try:
+            data, _ = s.recvfrom(64)
+            s.close()
+            return len(data) >= 4 and data[0] == 2 and data[3] == 1  # PUSH_ACK
+        except _sock.timeout:
+            s.close()
+            return False
+    except Exception:
+        return False
+
+def configure_local_ns_forwarder():
+    """Auto-configure semtech-udp-forwarder for local NS.
+    Creates mesh_forwarder.toml pointing to LGB on Docker bridge.
+    """
+    cfg_path = "/opt/chirpstack/mesh_forwarder.toml"
+    try:
+        with open(cfg_path, "w") as f:
+            f.write(f'semtech_server = "{DOCKER_BRIDGE_IP}"\nsemtech_port = 1700\n')
+        log.info("Local NS detected: configured semtech-udp-forwarder → %s:1700", DOCKER_BRIDGE_IP)
+        return True
+    except Exception as e:
+        log.warning("Failed to configure local NS forwarder: %s", e)
+        return False
 # Also check mesh_config.toml (source of truth) in case env var is stale
 try:
     _mc = open(MESH_CONFIG_PATH).read()
@@ -1268,17 +1310,27 @@ def api_set_mesh():
             pass
         # Auto-manage forwarder services based on role
         if new_border:
-            # Border: start forwarder (mqtt or udp depending on current protocol)
-            try:
-                proto = open("/opt/chirpstack/.forwarder_protocol").read().strip()
-            except Exception:
-                proto = "mqtt"
-            if proto == "udp":
+            # Border: detect local NS and choose appropriate forwarder
+            local_ns = detect_local_ns()
+            if local_ns:
+                # Local NS detected: ALWAYS use Semtech UDP path
+                # (mqtt-forwarder uses MQTT v5, incompatible with gateway mosquitto 1.4.x)
+                configure_local_ns_forwarder()
                 subprocess.run(sc + ["start", "semtech-udp-forwarder"], timeout=5, capture_output=True)
                 subprocess.run(sc + ["stop", "mqtt-forwarder"], timeout=5, capture_output=True)
+                _write_forwarder_protocol("udp")
             else:
-                subprocess.run(sc + ["start", "mqtt-forwarder"], timeout=5, capture_output=True)
-                subprocess.run(sc + ["stop", "semtech-udp-forwarder"], timeout=5, capture_output=True)
+                # External NS: use saved protocol preference
+                try:
+                    proto = open("/opt/chirpstack/.forwarder_protocol").read().strip()
+                except Exception:
+                    proto = "mqtt"
+                if proto == "udp":
+                    subprocess.run(sc + ["start", "semtech-udp-forwarder"], timeout=5, capture_output=True)
+                    subprocess.run(sc + ["stop", "mqtt-forwarder"], timeout=5, capture_output=True)
+                else:
+                    subprocess.run(sc + ["start", "mqtt-forwarder"], timeout=5, capture_output=True)
+                    subprocess.run(sc + ["stop", "semtech-udp-forwarder"], timeout=5, capture_output=True)
         else:
             # Relay: stop all forwarders
             for svc in ["mqtt-forwarder", "semtech-udp-forwarder"]:
@@ -1446,6 +1498,18 @@ def api_restart(name):
     return jsonify({"ok": restart_svc(name)})
 
 if __name__ == "__main__":
+    # Auto-detect local NS at startup (border mode only)
+    if is_border():
+        if detect_local_ns():
+            configure_local_ns_forwarder()
+            sc = ["supervisorctl", "-c", "/etc/supervisord.conf"]
+            try:
+                subprocess.run(sc + ["start", "semtech-udp-forwarder"], timeout=5, capture_output=True)
+                subprocess.run(sc + ["stop", "mqtt-forwarder"], timeout=5, capture_output=True)
+                _write_forwarder_protocol("udp")
+            except Exception:
+                pass
+
     # Flask runs plain HTTP on 8080.
     # nginx (if configured) handles HTTPS on the same port and proxies to Flask.
     app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)

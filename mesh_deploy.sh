@@ -45,17 +45,15 @@ download() {
 # ── Parse arguments ──
 
 ROLE="relay"
-LOCAL_NS="false"
 for arg in "$@"; do
   case "$arg" in
-    --relay)     ROLE="relay" ;;
-    --border)    ROLE="border" ;;
-    --local-ns)  LOCAL_NS="true" ;;
+    --relay)  ROLE="relay" ;;
+    --border) ROLE="border" ;;
   esac
 done
 RELAY_BORDER="false"
 [ "$ROLE" = "border" ] && RELAY_BORDER="true"
-info "Deploying as ${ROLE} gateway$([ "$LOCAL_NS" = "true" ] && echo " (built-in NS)")"
+info "Deploying as ${ROLE} gateway"
 
 mkdir -p "$WORK_DIR"
 
@@ -636,44 +634,33 @@ fi
 # Symlink for unified log access
 $DOCKER_BIN exec ${CONTAINER_NAME} ln -sf /tmp/mesh.log /tmp/gateway-mesh.log 2>/dev/null
 
-# ── Local NS setup (Semtech UDP path) ──
-# IMPORTANT: Built-in NS uses Semtech UDP (NOT mqtt-forwarder).
-#   Container semtech-udp-forwarder → UDP → LGB (MQTT v3.1.1) → loraserver (NS)
-#   mqtt-forwarder uses MQTT v5 which is incompatible with gateway mosquitto 1.4.x
-if [ "$LOCAL_NS" = "true" ] && [ "$RELAY_BORDER" = "true" ]; then
-  info "  Setting up built-in NS (Semtech UDP path)..."
+# ── Auto-detect built-in NS and start host services ──
+# If loraserver is running on host, this gateway has a built-in NS.
+# Start LGB + lora_app_server (required for Semtech UDP forwarder path).
+# The container's web_ui will auto-detect LGB and configure the UDP forwarder.
+# NOTE: Built-in NS ALWAYS uses Semtech UDP (not mqtt-forwarder), because
+# ChirpStack v4 mqtt-forwarder uses MQTT v5 which is incompatible with
+# gateway mosquitto v1.4.x (only supports MQTT v3.1.1).
+if [ "$RELAY_BORDER" = "true" ] && pgrep -x loraserver >/dev/null 2>&1; then
+  info "  Built-in NS detected on host — starting supporting services..."
 
-  # Add loraappserver MQTT user (may be missing on fresh gateways)
+  # Sync loraappserver MQTT user (may be missing on fresh gateways)
   if command -v mosquitto_passwd >/dev/null 2>&1; then
     mosquitto_passwd -b /etc/mosquitto/pwd loraappserver "URloraappserver123456" 2>/dev/null && \
       info "    loraappserver MQTT user synced" || true
-    /etc/init.d/mosquitto restart 2>/dev/null
-    sleep 1
   fi
 
-  # Start LGB (LoRa Gateway Bridge) — bridges Semtech UDP to MQTT
-  if [ -f /etc/init.d/lora_gateway_bridge ]; then
+  # Start LGB (LoRa Gateway Bridge) — bridges Semtech UDP ↔ MQTT
+  if [ -f /etc/init.d/lora_gateway_bridge ] && ! pgrep -x lora-gateway-bridge >/dev/null 2>&1; then
     /etc/init.d/lora_gateway_bridge start 2>/dev/null && info "    LGB started" || true
     /etc/init.d/lora_gateway_bridge enable 2>/dev/null || true
   fi
 
   # Start lora_app_server (Application Server)
-  if [ -f /etc/init.d/lora_app_server ]; then
+  if [ -f /etc/init.d/lora_app_server ] && ! pgrep -x lora-app-server >/dev/null 2>&1; then
     /etc/init.d/lora_app_server start 2>/dev/null && info "    lora_app_server started" || true
     /etc/init.d/lora_app_server enable 2>/dev/null || true
   fi
-
-  # Configure semtech-udp-forwarder to target local LGB (Docker bridge IP:1700)
-  $DOCKER_BIN exec ${CONTAINER_NAME} sh -c '
-    cat > /opt/chirpstack/mesh_forwarder.toml << "FWDEOF"
-semtech_server = "172.17.0.1"
-semtech_port = 1700
-FWDEOF
-  ' && info "    semtech-udp-forwarder → LGB (172.17.0.1:1700)" || true
-
-  # Stop mqtt-forwarder (incompatible with local mosquitto)
-  $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl stop mqtt-forwarder 2>/dev/null
-  info "    mqtt-forwarder disabled (MQTT v5 incompatible with local mosquitto)"
 fi
 
 # ── Step 9: Final restart — apply ALL injected changes ──
