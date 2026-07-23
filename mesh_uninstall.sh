@@ -23,47 +23,59 @@ if [ -z "$DOCKER_BIN" ]; then
   exit 0
 fi
 
-# ── Step 1: Stop and remove container ──
-info "Step 1/4: Removing mesh container..."
+# ── Step 1: Stop and remove container + image ──
+info "Step 1/5: Removing mesh container and image..."
 if $DOCKER_BIN ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
   $DOCKER_BIN rm -f "$CONTAINER_NAME" 2>/dev/null && info "  Container removed" || warn "  Failed to remove container"
 else
   info "  No mesh container found"
 fi
 
-# ── Step 2: Stop password sync watcher ──
-info "Step 2/4: Stopping services..."
+# Remove mesh Docker image
+MESH_IMG=$($DOCKER_BIN images --format "{{.ID}}" "chirpstack-mesh-gw" 2>/dev/null | head -1)
+if [ -n "$MESH_IMG" ]; then
+  $DOCKER_BIN rmi -f "$MESH_IMG" 2>/dev/null && info "  Mesh image removed" || warn "  Failed to remove image"
+fi
+
+# ── Step 2: Stop services ──
+info "Step 2/5: Stopping services..."
 if [ -f /etc/init.d/mesh_pwd_sync ]; then
   /etc/init.d/mesh_pwd_sync stop 2>/dev/null
   rm -f /etc/init.d/mesh_pwd_sync
-  info "  Password sync watcher stopped and removed"
+  info "  Password sync watcher removed"
 fi
 
-# ── Step 3: Clean up persistent files ──
-info "Step 3/4: Cleaning up files..."
-for f in /etc/chirpstack-concentratord-sx1302-sysfs /etc/ug56_patch.sh; do
-  if [ -f "$f" ]; then
-    rm -f "$f"
-    info "  Removed $f"
-  fi
+# ── Step 3: Clean up all mesh-related files ──
+info "Step 3/5: Cleaning up files..."
+for f in \
+  /etc/chirpstack-concentratord-sx1302-sysfs \
+  /etc/ug56_patch.sh \
+  /tmp/.mesh_container_running \
+  /tmp/mesh_deploy.sh \
+  /tmp/mesh_deploy.log \
+  /tmp/chirpstack-mesh-gw-new.tar.gz \
+  /tmp/chirpstack-mesh-gw-v4.tar.gz; do
+  [ -f "$f" ] && rm -f "$f"
 done
 rm -rf /tmp/mesh-deploy 2>/dev/null
-rm -f /tmp/mesh_deploy.sh /tmp/mesh_deploy.log 2>/dev/null
+info "  Temp files cleaned"
 
-# ── Step 4: Restart native packet forwarder ──
-info "Step 4/4: Restoring native packet forwarder..."
-RESTARTED=0
-
-# Stop and remove pkt_fwd watchdog
+# ── Step 4: Remove pkt_fwd watchdog ──
+info "Step 4/5: Removing watchdog..."
 if [ -f "/etc/init.d/mesh_pkt_fwd_guard" ]; then
     /etc/init.d/mesh_pkt_fwd_guard stop 2>/dev/null
     /etc/init.d/mesh_pkt_fwd_guard disable 2>/dev/null
     rm -f /etc/init.d/mesh_pkt_fwd_guard
-    info "  Removed lora_pkt_fwd watchdog"
+    info "  Removed pkt_fwd guard service"
 fi
 # Remove cron watchdog
-(crontab -l 2>/dev/null | grep -v mesh_container_running) | crontab -
-rm -f /tmp/.mesh_container_running
+(crontab -l 2>/dev/null | grep -v mesh_container_running) > /tmp/crontab_clean 2>/dev/null
+crontab /tmp/crontab_clean 2>/dev/null
+rm -f /tmp/crontab_clean
+
+# ── Step 5: Restart native packet forwarder ──
+info "Step 5/5: Restoring native packet forwarder..."
+RESTARTED=0
 
 if [ -f "/etc/init.d/lora_pkt_fwd" ]; then
     # Unexport GPIOs first (container may have left them exported)
@@ -81,10 +93,11 @@ fi
 [ "$RESTARTED" -eq 0 ] && warn "  No native packet forwarder service found"
 
 # ── Done ──
+HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || echo '<gateway-ip>')
 echo ""
 echo "============================================"
 echo " ${GREEN}LoRa Mesh uninstalled${NC}"
 echo "============================================"
-echo " Native pkt_fwd restored"
-echo " Web UI: https://$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || echo '<gateway-ip>')"
+echo " Native pkt_fwd: $([ $RESTARTED -eq 1 ] && echo 'restored' || echo 'not found')"
+echo " Web UI: http://${HOST_IP}"
 echo "============================================"

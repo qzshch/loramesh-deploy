@@ -3,6 +3,7 @@
 #  ChirpStack LoRa Mesh 一键部署脚本
 #  适用于: Milesight UG56/UG65/UG67/EG71 网关
 #  用法: sh mesh_deploy.sh [--border|--relay]
+#  注意: 如果是从 OSS 下载的，先执行: sed -i 's/\r$//' mesh_deploy.sh
 # ============================================================
 set -e
 
@@ -196,19 +197,61 @@ fi
 
 # ── Step 3: Download & load image ──
 
-info "Step 3/9: Downloading Mesh image (~39 MB)..."
-if ! $DOCKER_BIN images --format "{{.Repository}}" 2>/dev/null | grep -q "^${IMAGE_NAME}$"; then
-  if [ ! -f "${WORK_DIR}/chirpstack-mesh-gw.tar.gz" ]; then
-    download "$IMAGE_URL" "${WORK_DIR}/chirpstack-mesh-gw.tar.gz" || error "Docker image download failed"
-  fi
-  info "  Loading image..."
-  $DOCKER_BIN load -i "${WORK_DIR}/chirpstack-mesh-gw.tar.gz" 2>/dev/null || \
-    gunzip -c "${WORK_DIR}/chirpstack-mesh-gw.tar.gz" | $DOCKER_BIN load || \
-    error "Docker image load failed"
-  info "  Image loaded"
-else
-  info "Image already present, skipping"
+info "Step 3/9: Loading Mesh image (~45 MB)..."
+
+# Remove old mesh images to prevent overlay2 "max depth exceeded"
+# (accumulated orphan layers from previous load/rmi cycles)
+OLD_IMG=$($DOCKER_BIN images --format "{{.ID}}" "${IMAGE_NAME}" 2>/dev/null | head -1)
+if [ -n "$OLD_IMG" ]; then
+  info "  Removing old image..."
+  $DOCKER_BIN rmi -f "$OLD_IMG" 2>/dev/null || true
 fi
+
+# Download image if not cached locally
+if [ ! -f "${WORK_DIR}/chirpstack-mesh-gw.tar.gz" ]; then
+  download "$IMAGE_URL" "${WORK_DIR}/chirpstack-mesh-gw.tar.gz" || error "Docker image download failed"
+fi
+
+# Load image — handle "max depth exceeded" by cleaning overlay2 storage
+_load_image() {
+  $DOCKER_BIN load -i "${WORK_DIR}/chirpstack-mesh-gw.tar.gz" 2>&1
+}
+LOAD_OUT=$(_load_image)
+if echo "$LOAD_OUT" | grep -qi "max depth\|error"; then
+  warn "  Docker overlay2 depth limit reached — cleaning storage..."
+  $DOCKER_BIN stop $($DOCKER_BIN ps -aq) 2>/dev/null || true
+  $DOCKER_BIN rm -f $($DOCKER_BIN ps -aq) 2>/dev/null || true
+  # Stop Docker, clean overlay2, restart
+  /etc/init.d/docker stop 2>/dev/null
+  sleep 3
+  rm -rf /overlay/docker/overlay2 /overlay/docker/image /overlay/docker/containers
+  /etc/init.d/docker start 2>/dev/null
+  sleep 5
+  # Re-find docker binary (path may change after restart)
+  DOCKER_BIN=""
+  for d in /usr/bin/docker/docker /overlay/docker/bin/docker; do
+    [ -x "$d" ] && DOCKER_BIN="$d" && break
+  done
+  [ -z "$DOCKER_BIN" ] && command -v docker >/dev/null 2>&1 && DOCKER_BIN="docker"
+  [ -z "$DOCKER_BIN" ] && error "Docker not available after restart"
+  # Retry load
+  LOAD_OUT=$(_load_image)
+  echo "$LOAD_OUT" | grep -qi "error" && error "Docker image load failed after overlay2 cleanup: $LOAD_OUT"
+fi
+
+# Ensure image has :latest tag (tarball may have version tag like v4-stable)
+if $DOCKER_BIN images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | grep -q "${IMAGE_NAME}:" ; then
+  CURRENT_TAG=$($DOCKER_BIN images --format "{{.Tag}}" "${IMAGE_NAME}" 2>/dev/null | head -1)
+  if [ "$CURRENT_TAG" != "latest" ]; then
+    $DOCKER_BIN tag "${IMAGE_NAME}:${CURRENT_TAG}" "${IMAGE_NAME}:latest" 2>/dev/null
+    info "  Tagged ${CURRENT_TAG} → latest"
+  fi
+fi
+
+# Verify image loaded successfully
+$DOCKER_BIN images --format "{{.Repository}}" 2>/dev/null | grep -q "^${IMAGE_NAME}$" || \
+  error "Docker image load failed — image not found after load"
+info "  Image ready: $($DOCKER_BIN images --format '{{.Tag}} {{.Size}}' ${IMAGE_NAME} 2>/dev/null | head -1)"
 
 # ── Step 4: Detect hardware ──
 
