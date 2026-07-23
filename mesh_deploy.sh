@@ -496,6 +496,12 @@ for GPIO_DIR in /sys/class/gpio/gpio*; do
   echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
 done
 
+# CRITICAL: Wait for SX1250 radios to stabilize after GPIO reset.
+# Without this delay, concentratord's SPI init fails with STANDBY_RC error
+# on some hardware versions (especially after warm restarts).
+info "  Waiting 10s for SX1250 stabilization..."
+sleep 10
+
 $DOCKER_BIN run $DOCKER_OPTS ${IMAGE_NAME}
 sleep 3
 info "Container started"
@@ -623,19 +629,15 @@ EOF
 # v3 binary includes reset.rs fix: SX130x reset pin set HIGH after reset
 # sequence (Active→Inactive→Active), preventing Bug #49 at the source.
 #
-# IMPORTANT: v3 binary causes STANDBY_RC crash on some hardware (e.g. EG71
-# hwver=0100). Only inject on hwver=0150 where pin 17 disrupts SPI.
-# On other hardware, stock binary + RESET_GPIO=31 (harmless pin) works fine.
-V3_BIN="$SCRIPT_DIR/chirpstack-concentratord-sx1302-musl-v3"
-if [ -f "$V3_BIN" ] && [ "$HWVER" = "0150" ]; then
-  info "  Injecting v3 concentratord binary (reset fix, hwver=$HWVER)..."
-  $DOCKER_BIN cp "$V3_BIN" ${CONTAINER_NAME}:/opt/chirpstack/binaries/chirpstack-concentratord-sx1302 && \
-    $DOCKER_BIN exec ${CONTAINER_NAME} chmod +x /opt/chirpstack/binaries/chirpstack-concentratord-sx1302 && \
-    $DOCKER_BIN exec ${CONTAINER_NAME} sh -c "cd /opt/chirpstack/binaries && tar czf chirpstack-concentratord-sx1302.tar.gz chirpstack-concentratord-sx1302" && \
-    info "    v3 binary injected" || warn "    v3 binary injection failed, using stock"
-elif [ -f "$V3_BIN" ]; then
-  info "  Skipping v3 binary (hwver=$HWVER, stock binary works fine with pin 31)"
-fi
+# DISABLED: v3 binary causes intermittent STANDBY_RC crash on warm restarts.
+# Stock binary + RESET_GPIO=31 (harmless pin) + reset_lgw.sh external reset
+# is more reliable. v3 can be re-enabled after STANDBY_RC timing is fixed.
+#
+# V3_BIN="$SCRIPT_DIR/chirpstack-concentratord-sx1302-musl-v3"
+# if [ -f "$V3_BIN" ] && [ "$HWVER" = "0150" ]; then
+#   ...
+# fi
+info "  Using stock binary + pin 31 (v3 disabled, see Fix 1d)"
 
 # Fix 2: Python stdout buffering — add PYTHONUNBUFFERED to supervisord
 # Without this, gateway-mesh and forwarder produce NO log output in Docker
@@ -895,7 +897,33 @@ fi
 # This is critical: entrypoint re-copies source templates (now with band data)
 # to runtime files, and supervisord picks up all config changes from a clean state
 info "Step 9/9: Restarting container to apply all changes..."
-$DOCKER_BIN restart ${CONTAINER_NAME}
+# Stop container first (docker restart doesn't allow GPIO reset between stop/start)
+$DOCKER_BIN stop ${CONTAINER_NAME} >/dev/null 2>&1
+
+# GPIO reset between stop and start — critical for SX1250 stability
+for GPIO_DIR in /sys/class/gpio/gpio*; do
+  GPIO_NAME=$(basename "$GPIO_DIR" 2>/dev/null)
+  case "$GPIO_NAME" in gpiochip*|gpiolib*) continue ;; esac
+  echo "$GPIO_NAME" | grep -q '^gpio' || continue
+  NUM=$(echo "$GPIO_NAME" | sed 's/^gpio//')
+  echo "$NUM" | grep -q '^[0-9][0-9]*$' || continue
+  echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
+done
+/usr/sbin/reset_lgw.sh start >/dev/null 2>&1 || true
+sleep 1
+for GPIO_DIR in /sys/class/gpio/gpio*; do
+  GPIO_NAME=$(basename "$GPIO_DIR" 2>/dev/null)
+  case "$GPIO_NAME" in gpiochip*|gpiolib*) continue ;; esac
+  echo "$GPIO_NAME" | grep -q '^gpio' || continue
+  NUM=$(echo "$GPIO_NAME" | sed 's/^gpio//')
+  echo "$NUM" | grep -q '^[0-9][0-9]*$' || continue
+  echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
+done
+
+info "  Waiting 10s for SX1250 stabilization..."
+sleep 10
+
+$DOCKER_BIN start ${CONTAINER_NAME} >/dev/null 2>&1
 info "  Waiting for services to initialize (polling up to 90s)..."
 
 # Poll critical processes via supervisorctl until all RUNNING or timeout
