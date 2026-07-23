@@ -367,6 +367,28 @@ for GPIO_DIR in /sys/class/gpio/gpio*; do
 done
 info "  GPIO cleanup done"
 
+# ── Start built-in NS services BEFORE container (so web_ui can detect LGB) ──
+# If loraserver is running on host, start LGB + lora_app_server now.
+# Container's web_ui will detect LGB on startup and auto-configure the forwarder.
+if pgrep -x loraserver >/dev/null 2>&1; then
+  info "  Built-in NS detected — starting host services before container..."
+
+  if command -v mosquitto_passwd >/dev/null 2>&1; then
+    mosquitto_passwd -b /etc/mosquitto/pwd loraappserver "URloraappserver123456" 2>/dev/null && \
+      info "    loraappserver MQTT user synced" || true
+  fi
+
+  if [ -f /etc/init.d/lora_gateway_bridge ] && ! pgrep -x lora-gateway-bridge >/dev/null 2>&1; then
+    /etc/init.d/lora_gateway_bridge start 2>/dev/null && info "    LGB started" || true
+    /etc/init.d/lora_gateway_bridge enable 2>/dev/null || true
+  fi
+
+  if [ -f /etc/init.d/lora_app_server ] && ! pgrep -x lora-app-server >/dev/null 2>&1; then
+    /etc/init.d/lora_app_server start 2>/dev/null && info "    lora_app_server started" || true
+    /etc/init.d/lora_app_server enable 2>/dev/null || true
+  fi
+fi
+
 # ── Step 7: Start container ──
 
 info "Step 7/9: Starting Mesh container..."
@@ -634,37 +656,6 @@ fi
 
 # Symlink for unified log access
 $DOCKER_BIN exec ${CONTAINER_NAME} ln -sf /tmp/mesh.log /tmp/gateway-mesh.log 2>/dev/null
-
-# ── Auto-detect built-in NS and start host services ──
-# If loraserver is running on host, this gateway has a built-in NS.
-# Start LGB + lora_app_server regardless of current role (relay/border),
-# because the user can switch roles anytime via Web UI.
-# The container's web_ui will auto-detect LGB and configure the UDP forwarder
-# when the user switches to border mode.
-# NOTE: Built-in NS ALWAYS uses Semtech UDP (not mqtt-forwarder), because
-# ChirpStack v4 mqtt-forwarder uses MQTT v5 which is incompatible with
-# gateway mosquitto v1.4.x (only supports MQTT v3.1.1).
-if pgrep -x loraserver >/dev/null 2>&1; then
-  info "  Built-in NS detected on host — starting supporting services..."
-
-  # Sync loraappserver MQTT user (may be missing on fresh gateways)
-  if command -v mosquitto_passwd >/dev/null 2>&1; then
-    mosquitto_passwd -b /etc/mosquitto/pwd loraappserver "URloraappserver123456" 2>/dev/null && \
-      info "    loraappserver MQTT user synced" || true
-  fi
-
-  # Start LGB (LoRa Gateway Bridge) — bridges Semtech UDP ↔ MQTT
-  if [ -f /etc/init.d/lora_gateway_bridge ] && ! pgrep -x lora-gateway-bridge >/dev/null 2>&1; then
-    /etc/init.d/lora_gateway_bridge start 2>/dev/null && info "    LGB started" || true
-    /etc/init.d/lora_gateway_bridge enable 2>/dev/null || true
-  fi
-
-  # Start lora_app_server (Application Server)
-  if [ -f /etc/init.d/lora_app_server ] && ! pgrep -x lora-app-server >/dev/null 2>&1; then
-    /etc/init.d/lora_app_server start 2>/dev/null && info "    lora_app_server started" || true
-    /etc/init.d/lora_app_server enable 2>/dev/null || true
-  fi
-fi
 
 # ── Step 9: Final restart — apply ALL injected changes ──
 # This is critical: entrypoint re-copies source templates (now with band data)
