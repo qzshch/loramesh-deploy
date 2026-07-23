@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Semtech UDP Forwarder for ChirpStack Gateway Mesh (v2.1).
+Semtech UDP Forwarder for ChirpStack Gateway Mesh (v2.2).
 
-Uplink:  gateway-mesh proxy → Semtech UDP PUSH_DATA → LGB
-Downlink: LGB PULL_RESP → protobuf DownlinkFrame → gateway-mesh proxy → mesh
-RSSI:    parsed from gateway-mesh log (concentratord event proto lacks RSSI)
+Uplink:  gateway-mesh proxy (forwarder_event socket) → Semtech UDP PUSH_DATA → LGB
+Downlink: LGB PULL_RESP → protobuf DownlinkFrame → gateway-mesh proxy → concentratord
+RSSI:    from forwarder_event protobuf rx_info field 3 (float, border-received RSSI)
+
+Architecture: For built-in NS, always use Semtech UDP path (NOT mqtt-forwarder).
+  Container semtech-udp-forwarder → UDP → LGB (MQTT v3.1.1) → loraserver (NS)
+  mqtt-forwarder uses MQTT v5 which is incompatible with gateway mosquitto 1.4.x
 """
 
 import zmq
@@ -165,14 +169,11 @@ def decode_uplink(data):
     # uplink_id from field 2 (concentratord original uplink_id)
     uplink_id = _gv(rx, 2, 0)
 
-    # RSSI: try field 2 as sint32, field 3, or 0
-    rssi_raw = _gv(rx, 2, 0)
-    rssi_zz = (rssi_raw >> 1) ^ -(rssi_raw & 1) if rssi_raw else 0
-    rssi = rssi_zz if -200 <= rssi_zz <= 0 else 0
-
+    # RSSI: field 3 is float (from concentratord UplinkEvent.rssi)
+    rssi = int(_gf(rx, 3, 0.0))
     snr = _gf(rx, 7, 0.0)
 
-    # Try RSSI cache (from gateway-mesh log)
+    # Fallback: try RSSI cache (from gateway-mesh log) if protobuf RSSI is 0
     if rssi == 0 and uplink_id:
         cr, cs = rssi_cache.get(uplink_id)
         if cr is not None:
@@ -365,7 +366,7 @@ def get_gw_id():
 # ── Main ──
 
 def main():
-    log.info("Semtech UDP Forwarder v2.1 (downlink + RSSI from log)")
+    log.info("Semtech UDP Forwarder v2.2 (RSSI from forwarder_event protobuf)")
     host, port = read_config()
     log.info("Target: %s:%d", host, port)
     gw_id = get_gw_id()
