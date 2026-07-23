@@ -464,6 +464,7 @@ DOCKER_OPTS="-d --name $CONTAINER_NAME --restart unless-stopped \
   -v /etc/quagga/user_permission.conf:/etc/host_user_permission:ro \
   -v /etc/https.crt:/etc/ssl_cert:ro \
   -v /etc/https.key:/etc/ssl_key:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   -p 8088:8080 -p 8443:8443 \
   -e MODEL=${MODEL} \
   -e GW_MODEL=${GW_MODEL} \
