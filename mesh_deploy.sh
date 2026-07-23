@@ -246,40 +246,55 @@ if [ -n "$RESERVED" ] && [ ${#RESERVED} -ge 7 ]; then
 fi
 
 # GPIO mapping by product model
+# These are the REAL hardware reset pins (used by reset_lgw.sh via sysfs).
+# concentratord uses a HARMLESS pin (see override below) — the real reset is
+# done externally by reset_lgw.sh before the container starts.
 GPIO_CHIP_DEV=""
-SX1302_RESET_GPIO=0
-SX1261_RESET_GPIO=0
+SX1302_REAL_PIN=0    # Real SX1302 reset pin (for reset_lgw.sh reference)
+SX1261_REAL_PIN=0    # Real SX126X reset pin
 MODEL="rak_2287"
 
 case "$PRODUCT" in
   71)
     GPIO_CHIP_DEV="/dev/gpiochip2"
-    SX1302_RESET_GPIO=22
-    SX1261_RESET_GPIO=23
+    SX1302_REAL_PIN=22
+    SX1261_REAL_PIN=23
     info "EG71: gpiochip2, SX1302 reset=pin22, SX1261 reset=pin23"
     ;;
   56)
     GPIO_CHIP_DEV="/dev/gpiochip1"
-    SX1302_RESET_GPIO=8
-    SX1261_RESET_GPIO=10
+    SX1302_REAL_PIN=8
+    SX1261_REAL_PIN=10
     info "UG56: gpiochip1, SX1302 reset=pin8, SX1261 reset=pin10"
     ;;
-  65|67|*)
+  67)
     GPIO_CHIP_DEV="/dev/gpiochip4"
-    SX1302_RESET_GPIO=11
-    SX1261_RESET_GPIO=13
-    info "UG65/UG67: gpiochip4, SX1302 reset=pin11, SX1261 reset=pin13"
+    SX1302_REAL_PIN=0    # gpio-128 = pin 0 on gpiochip4
+    SX1261_REAL_PIN=1    # gpio-129 = pin 1
+    info "UG67: gpiochip4, SX1302 reset=pin0, SX1261 reset=pin1"
+    ;;
+  65|*)
+    GPIO_CHIP_DEV="/dev/gpiochip4"
+    SX1302_REAL_PIN=11   # gpio-139 = pin 11 on gpiochip4
+    SX1261_REAL_PIN=13   # gpio-141 = pin 13
+    info "UG65: gpiochip4, SX1302 reset=pin11, SX1261 reset=pin13"
     ;;
 esac
 
-# Override: use RESET_GPIO=0 for all models (Bug #49)
-# concentratord's cdev reset leaves the GPIO LOW after reset. On Milesight gateways,
-# LOW on the SX1302 reset pin keeps the chip in reset → lgw_send fails, TX never works.
-# Fix: set RESET_GPIO=0 so concentratord falls back to its hardcoded pin 17
-# (harmless unused GPIO on all Milesight models). The real SX1302 hardware reset
-# is handled externally by reset_lgw.sh (Step 6) which correctly sets the pin HIGH.
-SX1302_RESET_GPIO=0
-info "Product=$PRODUCT, Band=${GW_BAND}MHz"
+# Override: use harmless pin 31 for concentratord's internal cdev reset (Bug #49 fix)
+#
+# concentratord's gpiochip cdev reset leaves the GPIO LOW after reset.
+# If it uses the REAL SX1302 reset pin → chip held in reset → TX fails.
+# If it toggles certain pins on some hwver → SPI bus disrupted → chip version 0x00.
+#
+# Solution: use pin 31 (unconnected on ALL Milesight models) for concentratord's
+# cdev reset. The REAL hardware reset is done by reset_lgw.sh (Step 6) using
+# sysfs, which correctly sets the pin to input (high-Z) after reset.
+#
+# With v3 binary (reset.rs fix): pin 31 ends HIGH after reset (extra safety).
+# With stock binary: pin 31 ends LOW after reset (harmless, pin is unconnected).
+SX1302_RESET_GPIO=31
+info "Product=$PRODUCT, Band=${GW_BAND}MHz, concentratord reset=pin${SX1302_RESET_GPIO} (harmless)"
 
 # UG56: download prerequisite files if missing
 if [ "$PRODUCT" = "56" ]; then
@@ -602,10 +617,19 @@ supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
 EOF
 ' && info "    supervisorctl enabled" || error "Fix 1c failed: supervisorctl sections"
 
-# Fix 1d: No-op — RESET_GPIO=0 (set below) already prevents concentratord from
-# using the real SX1302 reset pin. The rak_2287 model default (pin 17) is a
-# harmless unconnected GPIO on all Milesight models. The real SX1302 hardware
-# reset is done externally by reset_lgw.sh (Step 6). See Bug #49 for details.
+# Fix 1d: Inject v3 concentratord binary (if available)
+# v3 binary includes reset.rs fix: SX130x reset pin set HIGH after reset
+# sequence (Active→Inactive→Active), preventing Bug #49 at the source.
+# This allows using the correct reset pin without the pin-stays-LOW problem.
+# Without v3: stock binary + pin 31 (harmless) still works fine.
+V3_BIN="$SCRIPT_DIR/chirpstack-concentratord-sx1302-musl-v3"
+if [ -f "$V3_BIN" ]; then
+  info "  Injecting v3 concentratord binary (reset fix)..."
+  $DOCKER_BIN cp "$V3_BIN" ${CONTAINER_NAME}:/opt/chirpstack/binaries/chirpstack-concentratord-sx1302 && \
+    $DOCKER_BIN exec ${CONTAINER_NAME} chmod +x /opt/chirpstack/binaries/chirpstack-concentratord-sx1302 && \
+    $DOCKER_BIN exec ${CONTAINER_NAME} sh -c "cd /opt/chirpstack/binaries && tar czf chirpstack-concentratord-sx1302.tar.gz chirpstack-concentratord-sx1302" && \
+    info "    v3 binary injected" || warn "    v3 binary injection failed, using stock"
+fi
 
 # Fix 2: Python stdout buffering — add PYTHONUNBUFFERED to supervisord
 # Without this, gateway-mesh and forwarder produce NO log output in Docker
