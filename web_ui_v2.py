@@ -155,36 +155,21 @@ def write_forwarder_state(**kwargs):
         f.write(f'semtech_port = {state["semtech_port"]}\n')
 
 def detect_local_ns():
-    """Detect if built-in NS (LGB) is running on host.
-    Sends a Semtech UDP PUSH_DATA packet to LGB port 1700 on Docker bridge.
-    Returns True if LGB responds with PUSH_ACK.
+    """Detect if built-in NS is running on host.
+    Checks if mosquitto is reachable on Docker bridge IP:1883 (TCP).
+    Mosquitto on Docker bridge is always present when loraserver is running.
 
     IMPORTANT: Built-in NS always uses Semtech UDP path (not mqtt-forwarder),
     because ChirpStack v4 mqtt-forwarder uses MQTT v5 which is incompatible
     with gateway mosquitto v1.4.x (only supports v3.1.1).
     """
     import socket as _sock
-    # Get gateway EUI for the probe packet (LGB may reject unknown MACs)
-    gw_mac = b'\x00' * 8
     try:
-        eui = open("/opt/chirpstack/gateway_eui.txt").read().strip()
-        if len(eui) == 16:
-            gw_mac = bytes.fromhex(eui)
-    except Exception:
-        pass
-    try:
-        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
         s.settimeout(2)
-        # Semtech UDP PUSH_DATA: version=2, token=random, id=0, gateway_mac
-        push_data = b'\x02\xab\xcd\x00' + gw_mac
-        s.sendto(push_data, (DOCKER_BRIDGE_IP, 1700))
-        try:
-            data, _ = s.recvfrom(64)
-            s.close()
-            return len(data) >= 4 and data[0] == 2 and data[3] == 1  # PUSH_ACK
-        except _sock.timeout:
-            s.close()
-            return False
+        s.connect((DOCKER_BRIDGE_IP, 1883))
+        s.close()
+        return True
     except Exception:
         return False
 
