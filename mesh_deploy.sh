@@ -599,28 +599,26 @@ supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
 EOF
 ' && info "    supervisorctl enabled" || error "Fix 1c failed: supervisorctl sections"
 
-# Fix 1d: Inject correct SX1302 reset GPIO chip/pin into concentratord.toml
-# The rak_2287 model config hardcodes /dev/gpiochip0 pin 17, but Milesight
-# gateways use different gpiochip devices depending on the model.
-# With --privileged, host gpiochip devices are directly accessible.
-# Inject sx1302_reset_chip and sx1302_reset_pin to override the model default.
-# Skip for UG56: it uses a custom sysfs-based concentratord binary, not gpiochip cdev.
+# Fix 1d: Override SX1302 reset pin in concentratord.toml
+# The rak_2287 model config hardcodes pin 17, but Milesight gateways use
+# different reset pins. The Docker device mapping already maps the correct
+# host gpiochip to /dev/gpiochip0 inside the container, so we only need
+# to override the pin number.
+# Skip for UG56: it uses a custom sysfs-based concentratord binary.
 if [ "$PRODUCT" != "56" ]; then
-  info "  Injecting SX1302 reset GPIO config (${GPIO_CHIP_DEV} pin ${SX1302_RESET_GPIO})..."
+  info "  Overriding SX1302 reset pin to ${SX1302_RESET_GPIO} (model default: 17)..."
   $DOCKER_BIN exec ${CONTAINER_NAME} sh -c "
-    # Remove any existing reset overrides
-    sed -i '/sx1302_reset_chip/d' /opt/chirpstack/concentratord.toml
+    # Remove any existing reset pin override
     sed -i '/sx1302_reset_pin/d' /opt/chirpstack/concentratord.toml
-    # Inject correct GPIO chip and pin after model_flags line
-    sed -i '/model_flags/a sx1302_reset_chip=\"${GPIO_CHIP_DEV}\"' /opt/chirpstack/concentratord.toml
-    sed -i '/sx1302_reset_chip/a sx1302_reset_pin=${SX1302_RESET_GPIO}' /opt/chirpstack/concentratord.toml
-  " && info "    sx1302_reset_chip=${GPIO_CHIP_DEV}, pin=${SX1302_RESET_GPIO} injected" \
+    # Inject correct pin number after model_flags line
+    sed -i '/model_flags/a sx1302_reset_pin=${SX1302_RESET_GPIO}' /opt/chirpstack/concentratord.toml
+  " && info "    sx1302_reset_pin=${SX1302_RESET_GPIO} injected" \
      || error "Fix 1d failed: TOML injection"
 
   # Restart concentratord to pick up the new config
   $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl restart concentratord 2>/dev/null
   sleep 3
-  info "    concentratord restarted with correct GPIO config"
+  info "    concentratord restarted with correct reset pin"
 else
   info "  Skipping Fix 1d (UG56 uses sysfs-based concentratord)"
 fi
