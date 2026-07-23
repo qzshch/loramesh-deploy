@@ -217,10 +217,12 @@ fi
 info "Step 4/9: Detecting hardware..."
 PRODUCT=""
 RESERVED=""
+HWVER=""
 if command -v urtool >/dev/null 2>&1; then
   UR_OUT=$(urtool -g 2>/dev/null)
   PRODUCT=$(echo "$UR_OUT" | grep "^product" | awk -F: '{print $2}' | tr -d ' ')
   RESERVED=$(echo "$UR_OUT" | grep "^reserved" | head -1 | awk -F: '{print $2}' | tr -d ' ')
+  HWVER=$(echo "$UR_OUT" | grep "^hwver" | awk -F: '{print $2}' | tr -d ' ')
 fi
 # Fallback: model marker files
 [ -z "$PRODUCT" ] && [ -f /tmp/71 ] && PRODUCT="71"
@@ -617,18 +619,22 @@ supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
 EOF
 ' && info "    supervisorctl enabled" || error "Fix 1c failed: supervisorctl sections"
 
-# Fix 1d: Inject v3 concentratord binary (if available)
+# Fix 1d: Inject v3 concentratord binary (hwver=0150 only)
 # v3 binary includes reset.rs fix: SX130x reset pin set HIGH after reset
 # sequence (Active→Inactive→Active), preventing Bug #49 at the source.
-# This allows using the correct reset pin without the pin-stays-LOW problem.
-# Without v3: stock binary + pin 31 (harmless) still works fine.
+#
+# IMPORTANT: v3 binary causes STANDBY_RC crash on some hardware (e.g. EG71
+# hwver=0100). Only inject on hwver=0150 where pin 17 disrupts SPI.
+# On other hardware, stock binary + RESET_GPIO=31 (harmless pin) works fine.
 V3_BIN="$SCRIPT_DIR/chirpstack-concentratord-sx1302-musl-v3"
-if [ -f "$V3_BIN" ]; then
-  info "  Injecting v3 concentratord binary (reset fix)..."
+if [ -f "$V3_BIN" ] && [ "$HWVER" = "0150" ]; then
+  info "  Injecting v3 concentratord binary (reset fix, hwver=$HWVER)..."
   $DOCKER_BIN cp "$V3_BIN" ${CONTAINER_NAME}:/opt/chirpstack/binaries/chirpstack-concentratord-sx1302 && \
     $DOCKER_BIN exec ${CONTAINER_NAME} chmod +x /opt/chirpstack/binaries/chirpstack-concentratord-sx1302 && \
     $DOCKER_BIN exec ${CONTAINER_NAME} sh -c "cd /opt/chirpstack/binaries && tar czf chirpstack-concentratord-sx1302.tar.gz chirpstack-concentratord-sx1302" && \
     info "    v3 binary injected" || warn "    v3 binary injection failed, using stock"
+elif [ -f "$V3_BIN" ]; then
+  info "  Skipping v3 binary (hwver=$HWVER, stock binary works fine with pin 31)"
 fi
 
 # Fix 2: Python stdout buffering — add PYTHONUNBUFFERED to supervisord
