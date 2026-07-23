@@ -616,6 +616,13 @@ if [ "$PRODUCT" != "56" ]; then
      || error "Fix 1d failed: TOML injection"
 
   # Restart concentratord to pick up the new config
+  # Wait for supervisord socket to be ready first
+  for i in $(seq 1 10); do
+    if $DOCKER_BIN exec ${CONTAINER_NAME} test -S /var/run/supervisor.sock 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
   $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl restart concentratord 2>/dev/null
   sleep 3
   info "    concentratord restarted with correct reset pin"
