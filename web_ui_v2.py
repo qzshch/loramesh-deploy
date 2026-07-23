@@ -128,6 +128,31 @@ CONFIGS_DIR = "/opt/chirpstack/configs/chirpstack-concentratord-sx1302"
 IS_BORDER = os.environ.get("RELAY_BORDER", "false") == "true"
 
 DOCKER_BRIDGE_IP = "172.17.0.1"
+FORWARDER_STATE_PATH = "/opt/chirpstack/forwarder_state.toml"
+
+def read_forwarder_state():
+    """Read persistent forwarder state. Returns dict with protocol, semtech_server, semtech_port."""
+    state = {"protocol": "mqtt", "semtech_server": DOCKER_BRIDGE_IP, "semtech_port": 1700}
+    try:
+        c = open(FORWARDER_STATE_PATH).read()
+        m = re.search(r'protocol\s*=\s*"([^"]+)"', c)
+        if m: state["protocol"] = m.group(1)
+        m = re.search(r'semtech_server\s*=\s*"([^"]+)"', c)
+        if m: state["semtech_server"] = m.group(1)
+        m = re.search(r'semtech_port\s*=\s*(\d+)', c)
+        if m: state["semtech_port"] = int(m.group(1))
+    except FileNotFoundError:
+        pass
+    return state
+
+def write_forwarder_state(**kwargs):
+    """Write persistent forwarder state. Merges with existing values."""
+    state = read_forwarder_state()
+    state.update(kwargs)
+    with open(FORWARDER_STATE_PATH, "w") as f:
+        f.write(f'protocol = "{state["protocol"]}"\n')
+        f.write(f'semtech_server = "{state["semtech_server"]}"\n')
+        f.write(f'semtech_port = {state["semtech_port"]}\n')
 
 def detect_local_ns():
     """Detect if built-in NS (LGB) is running on host.
@@ -158,12 +183,14 @@ def detect_local_ns():
 def configure_local_ns_forwarder():
     """Auto-configure semtech-udp-forwarder for local NS.
     Creates mesh_forwarder.toml pointing to LGB on Docker bridge.
+    Writes persistent state so entrypoint can restore on restart.
     """
     cfg_path = "/opt/chirpstack/mesh_forwarder.toml"
     try:
         with open(cfg_path, "w") as f:
             f.write(f'semtech_server = "{DOCKER_BRIDGE_IP}"\nsemtech_port = 1700\n')
-        log.info("Local NS detected: configured semtech-udp-forwarder → %s:1700", DOCKER_BRIDGE_IP)
+        write_forwarder_state(protocol="udp", semtech_server=DOCKER_BRIDGE_IP, semtech_port=1700)
+        log.info("Local NS detected: configured semtech-udp-forwarder → %s:1700 (state saved)", DOCKER_BRIDGE_IP)
         return True
     except Exception as e:
         log.warning("Failed to configure local NS forwarder: %s", e)
@@ -1335,6 +1362,7 @@ def api_set_mesh():
             # Relay: stop all forwarders
             for svc in ["mqtt-forwarder", "semtech-udp-forwarder"]:
                 subprocess.run(sc + ["stop", svc], timeout=5, capture_output=True)
+            write_forwarder_state(protocol="none")
     return jsonify({"ok": ok})
 
 @app.route("/api/config/mqtt", methods=["GET"])
@@ -1410,7 +1438,7 @@ def _read_forwarder_cfg():
     return cfg
 
 def _write_forwarder_protocol(proto):
-    """Set active protocol in mesh_forwarder.toml."""
+    """Set active protocol in mesh_forwarder.toml and persist to state file."""
     path = "/opt/chirpstack/mesh_forwarder.toml"
     try:
         c = open(path).read()
@@ -1421,6 +1449,8 @@ def _write_forwarder_protocol(proto):
         open(path, "w").write(c)
     except Exception:
         pass
+    # Persist to state file so entrypoint can restore on restart
+    write_forwarder_state(protocol=proto)
 
 def _write_udp_cfg(data):
     """Write Semtech UDP config to mesh_forwarder.toml."""
@@ -1498,15 +1528,39 @@ def api_restart(name):
     return jsonify({"ok": restart_svc(name)})
 
 if __name__ == "__main__":
-    # Auto-detect local NS at startup (border mode only)
-    if is_border():
+    # Restore forwarder state on startup
+    sc = ["supervisorctl", "-c", "/etc/supervisord.conf"]
+    state = read_forwarder_state()
+    proto = state.get("protocol", "")
+
+    if proto == "udp":
+        # Saved state: use Semtech UDP
+        try:
+            # Ensure mesh_forwarder.toml has correct target
+            cfg_path = "/opt/chirpstack/mesh_forwarder.toml"
+            c = open(cfg_path).read() if os.path.exists(cfg_path) else ""
+            if state["semtech_server"] not in c:
+                with open(cfg_path, "w") as f:
+                    f.write(f'semtech_server = "{state["semtech_server"]}"\n')
+                    f.write(f'semtech_port = {state["semtech_port"]}\n')
+            subprocess.run(sc + ["start", "semtech-udp-forwarder"], timeout=5, capture_output=True)
+            subprocess.run(sc + ["stop", "mqtt-forwarder"], timeout=5, capture_output=True)
+        except Exception:
+            pass
+    elif proto == "none":
+        # Saved state: relay mode, no forwarders
+        for svc in ["mqtt-forwarder", "semtech-udp-forwarder"]:
+            try:
+                subprocess.run(sc + ["stop", svc], timeout=5, capture_output=True)
+            except Exception:
+                pass
+    elif is_border() and not proto:
+        # No saved state + border mode: auto-detect local NS
         if detect_local_ns():
             configure_local_ns_forwarder()
-            sc = ["supervisorctl", "-c", "/etc/supervisord.conf"]
             try:
                 subprocess.run(sc + ["start", "semtech-udp-forwarder"], timeout=5, capture_output=True)
                 subprocess.run(sc + ["stop", "mqtt-forwarder"], timeout=5, capture_output=True)
-                _write_forwarder_protocol("udp")
             except Exception:
                 pass
 
