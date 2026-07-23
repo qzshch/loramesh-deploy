@@ -156,20 +156,28 @@ def write_forwarder_state(**kwargs):
 
 def detect_local_ns():
     """Detect if built-in NS (LGB) is running on host.
-    Sends a Semtech UDP STAT packet to LGB port 1700 on Docker bridge.
-    Returns True if LGB responds, indicating local NS is available.
+    Sends a Semtech UDP PUSH_DATA packet to LGB port 1700 on Docker bridge.
+    Returns True if LGB responds with PUSH_ACK.
 
     IMPORTANT: Built-in NS always uses Semtech UDP path (not mqtt-forwarder),
     because ChirpStack v4 mqtt-forwarder uses MQTT v5 which is incompatible
     with gateway mosquitto v1.4.x (only supports v3.1.1).
     """
     import socket as _sock
+    # Get gateway EUI for the probe packet (LGB may reject unknown MACs)
+    gw_mac = b'\x00' * 8
+    try:
+        eui = open("/opt/chirpstack/gateway_eui.txt").read().strip()
+        if len(eui) == 16:
+            gw_mac = bytes.fromhex(eui)
+    except Exception:
+        pass
     try:
         s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
         s.settimeout(2)
-        # Semtech UDP PUSH_DATA: protocol=2, random token, identifier=0 (PUSH_DATA), gateway ID
-        stat_pkt = b'\x02\x00\x00\x00' + b'\x00' * 8
-        s.sendto(stat_pkt, (DOCKER_BRIDGE_IP, 1700))
+        # Semtech UDP PUSH_DATA: version=2, token=random, id=0, gateway_mac
+        push_data = b'\x02\xab\xcd\x00' + gw_mac
+        s.sendto(push_data, (DOCKER_BRIDGE_IP, 1700))
         try:
             data, _ = s.recvfrom(64)
             s.close()
