@@ -370,7 +370,7 @@ info "  GPIO cleanup done"
 # ── Start built-in NS services BEFORE container (so web_ui can detect LGB) ──
 # If loraserver is running on host, start LGB + lora_app_server now.
 # Container's web_ui will detect LGB on startup and auto-configure the forwarder.
-if pgrep -x loraserver >/dev/null 2>&1; then
+if pidof loraserver >/dev/null 2>&1; then
   info "  Built-in NS detected — starting host services before container..."
 
   if command -v mosquitto_passwd >/dev/null 2>&1; then
@@ -378,12 +378,12 @@ if pgrep -x loraserver >/dev/null 2>&1; then
       info "    loraappserver MQTT user synced" || true
   fi
 
-  if [ -f /etc/init.d/lora_gateway_bridge ] && ! pgrep -x lora-gateway-bridge >/dev/null 2>&1; then
+  if [ -f /etc/init.d/lora_gateway_bridge ] && ! pidof lora-gateway-bridge >/dev/null 2>&1; then
     /etc/init.d/lora_gateway_bridge start 2>/dev/null && info "    LGB started" || true
     /etc/init.d/lora_gateway_bridge enable 2>/dev/null || true
   fi
 
-  if [ -f /etc/init.d/lora_app_server ] && ! pgrep -x lora-app-server >/dev/null 2>&1; then
+  if [ -f /etc/init.d/lora_app_server ] && ! pidof lora-app-server >/dev/null 2>&1; then
     /etc/init.d/lora_app_server start 2>/dev/null && info "    lora_app_server started" || true
     /etc/init.d/lora_app_server enable 2>/dev/null || true
   fi
