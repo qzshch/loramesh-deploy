@@ -636,12 +636,14 @@ $DOCKER_BIN exec ${CONTAINER_NAME} ln -sf /tmp/mesh.log /tmp/gateway-mesh.log 2>
 
 # ── Auto-detect built-in NS and start host services ──
 # If loraserver is running on host, this gateway has a built-in NS.
-# Start LGB + lora_app_server (required for Semtech UDP forwarder path).
-# The container's web_ui will auto-detect LGB and configure the UDP forwarder.
+# Start LGB + lora_app_server regardless of current role (relay/border),
+# because the user can switch roles anytime via Web UI.
+# The container's web_ui will auto-detect LGB and configure the UDP forwarder
+# when the user switches to border mode.
 # NOTE: Built-in NS ALWAYS uses Semtech UDP (not mqtt-forwarder), because
 # ChirpStack v4 mqtt-forwarder uses MQTT v5 which is incompatible with
 # gateway mosquitto v1.4.x (only supports MQTT v3.1.1).
-if [ "$RELAY_BORDER" = "true" ] && pgrep -x loraserver >/dev/null 2>&1; then
+if pgrep -x loraserver >/dev/null 2>&1; then
   info "  Built-in NS detected on host — starting supporting services..."
 
   # Sync loraappserver MQTT user (may be missing on fresh gateways)
