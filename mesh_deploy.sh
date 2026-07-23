@@ -8,8 +8,6 @@ set -e
 
 OSS_BASE="https://ursalink-resource-center.oss-us-west-1.aliyuncs.com/kevin"
 IMAGE_URL="${OSS_BASE}/chirpstack-mesh-gw.tar.gz"
-WEBUI_URL="${OSS_BASE}/web_ui_v2.py"
-FWD_URL="${OSS_BASE}/mesh_forwarder.py"
 DOCKER_URL="${OSS_BASE}/docker.tgz"
 COMPOSE_URL="${OSS_BASE}/docker-compose.tgz"
 IMAGE_NAME="chirpstack-mesh-gw"
@@ -506,47 +504,24 @@ $DOCKER_BIN run $DOCKER_OPTS ${IMAGE_NAME}
 sleep 3
 info "Container started"
 
-# ── Step 8: Post-deploy injection ──
+# ── Step 8: Post-deploy configuration ──
+# v4-stable image has most fixes baked in (nginx, pyzmq, pycryptodome, band data,
+# supervisorctl, gateway-mesh wrapper, socket cleanup, PYTHONUNBUFFERED).
+# Only runtime-specific tasks remain below.
 
-info "Step 8/9: Injecting latest files..."
-download "$WEBUI_URL" "${WORK_DIR}/web_ui_v2.py" && \
-  $DOCKER_BIN cp "${WORK_DIR}/web_ui_v2.py" ${CONTAINER_NAME}:/opt/chirpstack/web_ui.py && \
-  info "  web_ui_v2.py injected" || error "web_ui_v2.py download/inject failed"
+info "Step 8/9: Post-deploy configuration (v4-stable image)..."
 
-download "$FWD_URL" "${WORK_DIR}/mesh_forwarder.py" && \
-  $DOCKER_BIN cp "${WORK_DIR}/mesh_forwarder.py" ${CONTAINER_NAME}:/opt/chirpstack/mesh_forwarder.py && \
-  info "  mesh_forwarder.py injected" || error "mesh_forwarder.py download/inject failed"
-
-# Add semtech-udp-forwarder to supervisord
-$DOCKER_BIN exec ${CONTAINER_NAME} grep -q "semtech-udp-forwarder" /etc/supervisord.conf 2>/dev/null || \
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'cat >> /etc/supervisord.conf << "EOF"
-
-[program:semtech-udp-forwarder]
-command=python3 /opt/chirpstack/mesh_forwarder.py
-directory=/opt/chirpstack
-autostart=false
-autorestart=true
-startsecs=3
-stdout_logfile=/tmp/mesh.log
-stdout_logfile_maxbytes=0
-stderr_logfile=/tmp/mesh.log
-stderr_logfile_maxbytes=0
-redirect_stderr=true
-EOF'
-
-# Install pyzmq + pycryptodome (for Web UI auth) — critical, abort if missing
-info "  Checking Python dependencies..."
-for PKG in "zmq:pyzmq" "Crypto.Cipher.AES:pycryptodome"; do
-  IMPORT="${PKG%%:*}"
-  PIP_NAME="${PKG##*:}"
-  if $DOCKER_BIN exec ${CONTAINER_NAME} python3 -c "import ${IMPORT}" 2>/dev/null; then
-    info "    ${PIP_NAME} ✓"
-  else
-    info "    Installing ${PIP_NAME}..."
-    $DOCKER_BIN exec ${CONTAINER_NAME} pip3 install ${PIP_NAME} --break-system-packages -q && \
-      info "    ${PIP_NAME} installed" || error "${PIP_NAME} install failed — container has no PyPI access"
-  fi
-done
+# Verify baked-in components are present
+info "  Verifying image components..."
+VERIFY_OK=true
+$DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'command -v nginx' >/dev/null 2>&1 || { warn "  ❌ nginx missing"; VERIFY_OK=false; }
+$DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'python3 -c "import zmq"' 2>/dev/null || { warn "  ❌ pyzmq missing"; VERIFY_OK=false; }
+$DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'python3 -c "from Crypto.Cipher import AES"' 2>/dev/null || { warn "  ❌ pycryptodome missing"; VERIFY_OK=false; }
+$DOCKER_BIN exec ${CONTAINER_NAME} grep -q "start_gateway_mesh.sh" /etc/supervisord.conf 2>/dev/null || { warn "  ❌ gateway-mesh wrapper missing"; VERIFY_OK=false; }
+$DOCKER_BIN exec ${CONTAINER_NAME} grep -q "program:nginx" /etc/supervisord.conf 2>/dev/null || { warn "  ❌ nginx supervisord section missing"; VERIFY_OK=false; }
+if [ "$VERIFY_OK" = "true" ]; then
+  info "  ✅ All image components verified"
+fi
 
 # Sync MQTT credentials from host configs to mosquitto (host-level operation)
 if [ -f /etc/lora-gateway-bridge/lora-gateway-bridge.toml ] && command -v mosquitto_passwd >/dev/null 2>&1; then
@@ -566,209 +541,6 @@ if [ -f /etc/lora-gateway-bridge/lora-gateway-bridge.toml ] && command -v mosqui
   # Restart mosquitto to pick up new credentials
   /etc/init.d/mosquitto restart 2>/dev/null || true
 fi
-
-# Fix 1: Region hardcoding in supervisord.conf
-# Docker image ships with region_eu868.toml hardcoded in gateway-mesh command;
-# replace with region.toml (the canonical name created by entrypoint's cp command).
-# Do NOT use region_${TMP_REGION}.toml — that file doesn't exist at runtime.
-info "  Fixing supervisord region config..."
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c \
-  "sed -i 's|region_[a-z0-9_]*\.toml|region.toml|g' /etc/supervisord.conf" && \
-  info "    region -> region.toml" || error "Fix 1 failed: region sed replacement"
-
-# Fix 1b: gateway-mesh startup race — wait for concentratord ZMQ socket
-# Two problems:
-# 1. docker restart preserves /tmp → stale socket files from previous run
-#    fool gateway-mesh into thinking concentratord is ready
-# 2. concentratord needs ~3s to initialize SX1302 and create ZMQ sockets
-# Fix: clean stale sockets in entrypoint + wrapper waits for fresh socket
-info "  Fixing gateway-mesh startup race (socket wait)..."
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c '
-# Clean stale sockets on entrypoint startup (before supervisord)
-if ! grep -q "rm -f /tmp/concentratord_" /opt/chirpstack/entrypoint.sh; then
-  sed -i "/^exec.*supervisord/i rm -f /tmp/concentratord_* /tmp/forwarder_* 2>/dev/null" \
-    /opt/chirpstack/entrypoint.sh
-fi
-# Create wrapper that waits for fresh ZMQ socket
-cat > /opt/chirpstack/start_gateway_mesh.sh << "GWEOF"
-#!/bin/sh
-cd /opt/chirpstack
-SOCK="/tmp/${SOCKET_NAME:-concentratord}_event"
-i=0
-while [ $i -lt 30 ]; do
-  [ -S "$SOCK" ] && break
-  sleep 0.3
-  i=$((i+1))
-done
-exec ./chirpstack-gateway-mesh "$@"
-GWEOF
-chmod +x /opt/chirpstack/start_gateway_mesh.sh
-sed -i "s|command=/opt/chirpstack/chirpstack-gateway-mesh -c|command=/opt/chirpstack/start_gateway_mesh.sh -c|" /etc/supervisord.conf
-' && info "    socket cleanup + wrapper installed" || error "Fix 1b failed: gateway-mesh wrapper"
-
-# Fix 1c: supervisord.conf missing supervisorctl sections
-# Docker image's supervisord.conf only has [supervisord] and [program:*],
-# missing [unix_http_server], [supervisorctl], [rpcinterface:supervisor]
-# — without these, supervisorctl returns errors and Web UI Status page is empty
-info "  Adding supervisorctl sections to supervisord.conf..."
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c '
-  grep -q "unix_http_server" /etc/supervisord.conf || cat >> /etc/supervisord.conf << "EOF"
-
-[unix_http_server]
-file=/var/run/supervisor.sock
-
-[supervisorctl]
-serverurl=unix:///var/run/supervisor.sock
-
-[rpcinterface:supervisor]
-supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
-EOF
-' && info "    supervisorctl enabled" || error "Fix 1c failed: supervisorctl sections"
-
-# Fix 1d: Inject v3 concentratord binary (hwver=0150 only)
-# v3 binary includes reset.rs fix: SX130x reset pin set HIGH after reset
-# sequence (Active→Inactive→Active), preventing Bug #49 at the source.
-#
-# DISABLED: v3 binary causes intermittent STANDBY_RC crash on warm restarts.
-# Stock binary + RESET_GPIO=31 (harmless pin) + reset_lgw.sh external reset
-# is more reliable. v3 can be re-enabled after STANDBY_RC timing is fixed.
-#
-# V3_BIN="$SCRIPT_DIR/chirpstack-concentratord-sx1302-musl-v3"
-# if [ -f "$V3_BIN" ] && [ "$HWVER" = "0150" ]; then
-#   ...
-# fi
-info "  Using stock binary + pin 31 (v3 disabled, see Fix 1d)"
-
-# Fix 2: Python stdout buffering — add PYTHONUNBUFFERED to supervisord
-# Without this, gateway-mesh and forwarder produce NO log output in Docker
-info "  Fixing Python stdout buffering..."
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c '
-  # Add environment=PYTHONUNBUFFERED="1" to gateway-mesh section if missing
-  if ! grep -q "PYTHONUNBUFFERED" /etc/supervisord.conf; then
-    sed -i "/\[program:gateway-mesh\]/,/\[program:/{
-      /^command=/a environment=PYTHONUNBUFFERED=\"1\"
-    }" /etc/supervisord.conf
-    sed -i "/\[program:semtech-udp-forwarder\]/,/\[program:/{
-      /^command=/a environment=PYTHONUNBUFFERED=\"1\"
-    }" /etc/supervisord.conf
-  fi
-' 2>/dev/null && info "    PYTHONUNBUFFERED=1 added" || true
-
-# Fix 3: Relay mode — clear MQTT server to avoid connection overhead
-if [ "$RELAY_BORDER" != "true" ]; then
-  $DOCKER_BIN exec ${CONTAINER_NAME} sh -c \
-    'sed -i '"'"'s|server="tcp://.*"|server=""|'"'"' /opt/chirpstack/mqtt_forwarder.toml 2>/dev/null' && \
-    info "    Relay mode: MQTT server cleared" || true
-fi
-
-# Fix 5: Banner — show gateway model (UG65/EG71/etc.) instead of radio module name
-# MODEL env var must stay as radio module (rak_2287) for concentratord config;
-# inject literal gateway name directly into entrypoint banner.
-info "  Fixing entrypoint banner model display..."
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c \
-  "sed -i 's|.*echo \" Model:.*|echo \" Model:         ${GW_MODEL}\"|' /opt/chirpstack/entrypoint.sh 2>/dev/null" && \
-  info "    banner -> ${GW_MODEL}" || true
-
-# Fix 4: Add data-rate mapping to ALL region templates
-# Docker image only has [gateway.beacon], missing [gateway.band] data-rate mapping
-# Gateway-mesh needs this to map SF/BW to LoRaWAN DR index
-# Inject into SOURCE templates so entrypoint copies them on every restart
-info "  Injecting data-rate mappings for all regions..."
-BAND_OK=0; BAND_FAIL=0; BAND_TOTAL=0
-# Download active region first (most critical)
-BAND_ORDER="$TMP_REGION"
-for BAND_R in eu868 us915 in865 au915 as923 as923_2 as923_3 as923_4 kr920 ru864 eu433; do
-  [ "$BAND_R" != "$TMP_REGION" ] && BAND_ORDER="$BAND_ORDER $BAND_R"
-done
-for BAND_R in $BAND_ORDER; do
-  BAND_TOTAL=$((BAND_TOTAL + 1))
-  BAND_FILE="${WORK_DIR}/band_${BAND_R}.toml"
-  if download "${OSS_BASE}/band_${BAND_R}.toml" "$BAND_FILE" 2>/dev/null; then
-    if $DOCKER_BIN cp "$BAND_FILE" ${CONTAINER_NAME}:/tmp/band.toml 2>/dev/null && \
-       $DOCKER_BIN exec ${CONTAINER_NAME} sh -c \
-         "REGION_FILE=/opt/chirpstack/configs/chirpstack-concentratord-sx1302/region_${BAND_R}.toml; \
-          [ -f \"\$REGION_FILE\" ] || touch \"\$REGION_FILE\"; \
-          grep -q '\\[mappings\\]' \"\$REGION_FILE\" 2>/dev/null || \
-          cat /tmp/band.toml >> \"\$REGION_FILE\"; rm -f /tmp/band.toml" 2>/dev/null; then
-      BAND_OK=$((BAND_OK + 1))
-    else
-      BAND_FAIL=$((BAND_FAIL + 1))
-    fi
-  else
-    BAND_FAIL=$((BAND_FAIL + 1))
-  fi
-done
-info "    ${BAND_OK}/${BAND_TOTAL} regions injected (${BAND_FAIL} unavailable)"
-# Active region band data is critical — check it was injected
-if ! echo "$TMP_REGION" | grep -q "cn470"; then
-  ACTIVE_INJECTED=false
-  for OK_R in eu868 us915 in865 au915 as923 as923_2 as923_3 as923_4 kr920 ru864 eu433; do
-    [ "$TMP_REGION" = "$OK_R" ] && ACTIVE_INJECTED=true && break
-  done
-  if [ "$ACTIVE_INJECTED" = "true" ] && [ "$BAND_FAIL" -gt 0 ]; then
-    # Re-check specifically: did our region's band file succeed?
-    if ! $DOCKER_BIN exec ${CONTAINER_NAME} sh -c \
-      "grep -q '\[mappings\]' /opt/chirpstack/configs/chirpstack-concentratord-sx1302/region_${TMP_REGION}.toml 2>/dev/null"; then
-      error "Band data for active region '${TMP_REGION}' injection failed"
-    fi
-  fi
-fi
-
-# Setup nginx for HTTP+HTTPS reverse proxy to Flask web UI
-# Retry apk add (container network may be slow to stabilize after start)
-info "  Setting up nginx reverse proxy..."
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c '
-  if ! command -v nginx >/dev/null 2>&1; then
-    for i in 1 2 3; do
-      apk add --no-cache nginx 2>/dev/null && break
-      echo "apk attempt $i failed, retrying in 5s..."
-      sleep 5
-    done
-  fi
-  if ! command -v nginx >/dev/null 2>&1; then
-    echo "NGINX_INSTALL_FAILED"
-    exit 1
-  fi
-  # Write nginx site config
-  cat > /etc/nginx/http.d/mesh.conf << "NGINXEOF"
-server {
-    listen 8080;
-    server_name _;
-    location / {
-        proxy_pass http://127.0.0.1:5000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-}
-server {
-    listen 8443 ssl;
-    server_name _;
-    ssl_certificate /etc/ssl_cert;
-    ssl_certificate_key /etc/ssl_key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    location / {
-        proxy_pass http://127.0.0.1:5000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-}
-NGINXEOF
-  rm -f /etc/nginx/http.d/default.conf
-  # Add nginx to supervisord if not already present
-  grep -q "program:nginx" /etc/supervisord.conf || cat >> /etc/supervisord.conf << "SUPEOF"
-
-[program:nginx]
-command=nginx -g "daemon off;"
-autostart=true
-autorestart=true
-startsecs=1
-stdout_logfile=/tmp/nginx.log
-stderr_logfile=/tmp/nginx.log
-redirect_stderr=true
-SUPEOF
-' 2>/dev/null && info "    nginx installed + configured" || warn "    nginx install failed — Web UI only accessible via docker exec. Rebuild image with nginx baked in."
 
 # UG56: inject custom concentratord binary with sysfs GPIO support + patch entrypoint
 if [ "$PRODUCT" = "56" ]; then
@@ -809,7 +581,6 @@ if [ "$PRODUCT" = "56" ]; then
   fi
 
   # Patch entrypoint to source the patch script before exec supervisord
-  # Use awk (reliable across BusyBox versions — sed \n may not work)
   info "  UG56: patching entrypoint..."
   $DOCKER_BIN exec ${CONTAINER_NAME} sh -c '
     if ! grep -q "ug56_patch" /opt/chirpstack/entrypoint.sh; then
@@ -822,11 +593,8 @@ if [ "$PRODUCT" = "56" ]; then
 fi
 
 # Password sync watcher: background process that copies user_permission.conf when changed
-# (skip docker cp if already volume-mounted)
 if [ -f /etc/quagga/user_permission.conf ]; then
-  # Only copy if not already volume-mounted
   $DOCKER_BIN cp /etc/quagga/user_permission.conf ${CONTAINER_NAME}:/etc/host_user_permission 2>/dev/null || true
-  # Start a background watcher on the host (runs as a procd service)
   cat > /etc/init.d/mesh_pwd_sync << 'PWDEOF'
 #!/bin/sh /etc/rc.common
 USE_PROCD=1
@@ -863,35 +631,8 @@ PWDEOF
   info "  Password sync watcher started"
 fi
 
-# Write gateway_eui.txt for semtech-udp-forwarder
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c "echo ${GATEWAY_EUI} | tr 'A-F' 'a-f' > /opt/chirpstack/gateway_eui.txt" 2>/dev/null \
-  && info "  gateway_eui.txt written (${GATEWAY_EUI})" \
-  || error "gateway_eui.txt write failed"
+# Symlink for unified log access
 $DOCKER_BIN exec ${CONTAINER_NAME} ln -sf /tmp/mesh.log /tmp/gateway-mesh.log 2>/dev/null
-
-# ── Pre-restart verification: confirm all critical fixes were applied ──
-info "Verifying all fixes applied..."
-VERIFY_OK=true
-SUPERVISORD=$($DOCKER_BIN exec ${CONTAINER_NAME} cat /etc/supervisord.conf 2>/dev/null)
-ENTRYPOINT=$($DOCKER_BIN exec ${CONTAINER_NAME} cat /opt/chirpstack/entrypoint.sh 2>/dev/null)
-
-echo "$SUPERVISORD" | grep -q "region\.toml" || { warn "  ❌ region.toml not in supervisord.conf"; VERIFY_OK=false; }
-echo "$SUPERVISORD" | grep -q "start_gateway_mesh.sh" || { warn "  ❌ gateway-mesh wrapper not in supervisord.conf"; VERIFY_OK=false; }
-echo "$SUPERVISORD" | grep -q "unix_http_server" || { warn "  ❌ supervisorctl section missing"; VERIFY_OK=false; }
-echo "$SUPERVISORD" | grep -q "program:nginx" || { warn "  ❌ nginx not in supervisord.conf"; VERIFY_OK=false; }
-echo "$ENTRYPOINT" | grep -q "rm -f /tmp/concentratord_" || { warn "  ❌ socket cleanup not in entrypoint"; VERIFY_OK=false; }
-$DOCKER_BIN exec ${CONTAINER_NAME} test -x /opt/chirpstack/start_gateway_mesh.sh || { warn "  ❌ wrapper script missing"; VERIFY_OK=false; }
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'command -v nginx' >/dev/null 2>&1 || { warn "  ❌ nginx binary not installed"; VERIFY_OK=false; }
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'python3 -c "import zmq"' 2>/dev/null || { warn "  ❌ pyzmq not installed"; VERIFY_OK=false; }
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'python3 -c "from Crypto.Cipher import AES"' 2>/dev/null || { warn "  ❌ pycryptodome not installed"; VERIFY_OK=false; }
-$DOCKER_BIN exec ${CONTAINER_NAME} test -s /opt/chirpstack/gateway_eui.txt || { warn "  ❌ gateway_eui.txt missing or empty"; VERIFY_OK=false; }
-$DOCKER_BIN exec ${CONTAINER_NAME} grep -q "mesh context aware" /opt/chirpstack/mesh_forwarder.py 2>/dev/null || { warn "  ❌ mesh_forwarder.py v2.2 not injected (check OSS version)"; VERIFY_OK=false; }
-
-if [ "$VERIFY_OK" = "true" ]; then
-  info "  ✅ All fixes verified"
-else
-  warn "Pre-restart verification had warnings — continuing anyway (check warnings above)"
-fi
 
 # ── Step 9: Final restart — apply ALL injected changes ──
 # This is critical: entrypoint re-copies source templates (now with band data)
