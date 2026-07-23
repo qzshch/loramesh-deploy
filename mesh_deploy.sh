@@ -5,7 +5,7 @@
 #  用法: sh mesh_deploy.sh [--border|--relay]
 #  注意: 如果是从 OSS 下载的，先执行: sed -i 's/\r$//' mesh_deploy.sh
 # ============================================================
-set -e
+# Don't use set -e: individual commands have explicit error handling
 
 OSS_BASE="https://ursalink-resource-center.oss-us-west-1.aliyuncs.com/kevin"
 IMAGE_URL="${OSS_BASE}/chirpstack-mesh-gw.tar.gz"
