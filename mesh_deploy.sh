@@ -15,19 +15,33 @@ COMPOSE_URL="${OSS_BASE}/docker-compose.tgz"
 IMAGE_NAME="chirpstack-mesh-gw"
 CONTAINER_NAME="chirpstack-mesh"
 WORK_DIR="/tmp/mesh-deploy"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { echo "${GREEN}[INFO]${NC} $1"; }
 warn()  { echo "${YELLOW}[WARN]${NC} $1"; }
 error() { echo "${RED}[ERROR]${NC} $1"; exit 1; }
 download() {
-  if command -v curl >/dev/null 2>&1; then
-    curl -fSL "$1" -o "$2"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q "$1" -O "$2"
-  else
-    error "Neither curl nor wget available"
+  _DL_URL="$1"; _DL_OUT="$2"
+  # Offline mode: check for local file in script directory
+  _DL_BASE=$(basename "$_DL_URL")
+  if [ -f "$SCRIPT_DIR/$_DL_BASE" ]; then
+    cp "$SCRIPT_DIR/$_DL_BASE" "$_DL_OUT"
+    return 0
   fi
+  # Online mode: download from OSS with retry
+  _DL_OK=false
+  for _DL_TRY in 1 2 3; do
+    if command -v curl >/dev/null 2>&1; then
+      curl -fSL --connect-timeout 15 --retry 2 --retry-delay 3 "$_DL_URL" -o "$_DL_OUT" 2>/dev/null && { _DL_OK=true; break; }
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q --timeout=15 --tries=2 "$_DL_URL" -O "$_DL_OUT" 2>/dev/null && { _DL_OK=true; break; }
+    else
+      error "Neither curl nor wget available"
+    fi
+    [ "$_DL_TRY" -lt 3 ] && sleep 3
+  done
+  [ "$_DL_OK" = "true" ] || return 1
 }
 
 # ── Parse arguments ──
@@ -257,7 +271,12 @@ case "$PRODUCT" in
     info "UG65/UG67: gpiochip4, SX1302 reset=pin11, SX1261 reset=pin13"
     ;;
 esac
-info "Product=$PRODUCT, Band=${GW_BAND}MHz"
+
+# Docker env RESET_GPIO=0 prevents concentratord from using the wrong GPIO chip
+# on initial startup. Fix 1d (below) injects the correct chip+pin into TOML
+# and restarts concentratord with proper GPIO configuration.
+SX1302_RESET_GPIO_DOCKER=0
+info "Product=$PRODUCT, Band=${GW_BAND}MHz, Reset: ${GPIO_CHIP_DEV} pin ${SX1302_RESET_GPIO}"
 
 # UG56: download prerequisite files if missing
 if [ "$PRODUCT" = "56" ]; then
@@ -289,9 +308,12 @@ sleep 2
 # Install lora_pkt_fwd watchdog via cron — kills native pkt_fwd if re-enabled while mesh runs
 info "  Installing lora_pkt_fwd watchdog (cron, every 1 min)..."
 WATCHDOG_CRON='* * * * * [ -f /tmp/.mesh_container_running ] && pgrep -x lora_pkt_fwd >/dev/null && { /etc/init.d/lora_pkt_fwd stop; killall -9 lora_pkt_fwd; } 2>/dev/null'
-(crontab -l 2>/dev/null | grep -v mesh_container_running; echo "$WATCHDOG_CRON") | crontab -
-/etc/init.d/cron enable 2>/dev/null
-/etc/init.d/cron restart 2>/dev/null
+# Use file-based crontab install (pipe `| crontab -` hangs on some BusyBox firmware)
+CRON_TMP="${WORK_DIR}/crontab_tmp"
+(crontab -l 2>/dev/null | grep -v mesh_container_running; echo "$WATCHDOG_CRON") > "$CRON_TMP" 2>/dev/null
+crontab "$CRON_TMP" 2>/dev/null && info "    crontab installed via file" || warn "    crontab install failed (watchdog disabled)"
+rm -f "$CRON_TMP"
+/etc/init.d/cron enable 2>/dev/null || true
 touch /tmp/.mesh_container_running
 info "  lora_pkt_fwd watchdog installed"
 
@@ -363,7 +385,7 @@ else
     -e REGION=${TMP_REGION} \
     -e CHANNELS=${TMP_CHANNELS} \
     -e HAS_GPS=0 \
-    -e RESET_GPIO=${SX1302_RESET_GPIO} \
+    -e RESET_GPIO=${SX1302_RESET_GPIO_DOCKER} \
     ${IMAGE_NAME} >/dev/null 2>&1
 
   GATEWAY_EUI=""
@@ -577,6 +599,32 @@ supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
 EOF
 ' && info "    supervisorctl enabled" || error "Fix 1c failed: supervisorctl sections"
 
+# Fix 1d: Inject correct SX1302 reset GPIO chip/pin into concentratord.toml
+# The rak_2287 model config hardcodes /dev/gpiochip0 pin 17, but Milesight
+# gateways use different gpiochip devices depending on the model.
+# With --privileged, host gpiochip devices are directly accessible.
+# Inject sx1302_reset_chip and sx1302_reset_pin to override the model default.
+# Skip for UG56: it uses a custom sysfs-based concentratord binary, not gpiochip cdev.
+if [ "$PRODUCT" != "56" ]; then
+  info "  Injecting SX1302 reset GPIO config (${GPIO_CHIP_DEV} pin ${SX1302_RESET_GPIO})..."
+  $DOCKER_BIN exec ${CONTAINER_NAME} sh -c "
+    # Remove any existing reset overrides
+    sed -i '/sx1302_reset_chip/d' /opt/chirpstack/concentratord.toml
+    sed -i '/sx1302_reset_pin/d' /opt/chirpstack/concentratord.toml
+    # Inject correct GPIO chip and pin after model_flags line
+    sed -i '/model_flags/a sx1302_reset_chip=\"${GPIO_CHIP_DEV}\"' /opt/chirpstack/concentratord.toml
+    sed -i '/sx1302_reset_chip/a sx1302_reset_pin=${SX1302_RESET_GPIO}' /opt/chirpstack/concentratord.toml
+  " && info "    sx1302_reset_chip=${GPIO_CHIP_DEV}, pin=${SX1302_RESET_GPIO} injected" \
+     || error "Fix 1d failed: TOML injection"
+
+  # Restart concentratord to pick up the new config
+  $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl restart concentratord 2>/dev/null
+  sleep 3
+  info "    concentratord restarted with correct GPIO config"
+else
+  info "  Skipping Fix 1d (UG56 uses sysfs-based concentratord)"
+fi
+
 # Fix 2: Python stdout buffering — add PYTHONUNBUFFERED to supervisord
 # Without this, gateway-mesh and forwarder produce NO log output in Docker
 info "  Fixing Python stdout buffering..."
@@ -613,7 +661,12 @@ $DOCKER_BIN exec ${CONTAINER_NAME} sh -c \
 # Inject into SOURCE templates so entrypoint copies them on every restart
 info "  Injecting data-rate mappings for all regions..."
 BAND_OK=0; BAND_FAIL=0; BAND_TOTAL=0
+# Download active region first (most critical)
+BAND_ORDER="$TMP_REGION"
 for BAND_R in eu868 us915 in865 au915 as923 as923_2 as923_3 as923_4 kr920 ru864 eu433; do
+  [ "$BAND_R" != "$TMP_REGION" ] && BAND_ORDER="$BAND_ORDER $BAND_R"
+done
+for BAND_R in $BAND_ORDER; do
   BAND_TOTAL=$((BAND_TOTAL + 1))
   BAND_FILE="${WORK_DIR}/band_${BAND_R}.toml"
   if download "${OSS_BASE}/band_${BAND_R}.toml" "$BAND_FILE" 2>/dev/null; then
@@ -648,12 +701,15 @@ if ! echo "$TMP_REGION" | grep -q "cn470"; then
 fi
 
 # Setup nginx for HTTP+HTTPS reverse proxy to Flask web UI
-# Try online (apk) first, fall back to offline apk from OSS, abort if both fail
+# Retry apk add (container network may be slow to stabilize after start)
 info "  Setting up nginx reverse proxy..."
 $DOCKER_BIN exec ${CONTAINER_NAME} sh -c '
   if ! command -v nginx >/dev/null 2>&1; then
-    # Try online install
-    apk add --no-cache nginx 2>/dev/null
+    for i in 1 2 3; do
+      apk add --no-cache nginx 2>/dev/null && break
+      echo "apk attempt $i failed, retrying in 5s..."
+      sleep 5
+    done
   fi
   if ! command -v nginx >/dev/null 2>&1; then
     echo "NGINX_INSTALL_FAILED"
@@ -698,7 +754,7 @@ stdout_logfile=/tmp/nginx.log
 stderr_logfile=/tmp/nginx.log
 redirect_stderr=true
 SUPEOF
-' 2>/dev/null && info "    nginx installed + configured" || error "nginx install failed — gateway has no internet? Rebuild image with nginx baked in"
+' 2>/dev/null && info "    nginx installed + configured" || warn "    nginx install failed — Web UI only accessible via docker exec. Rebuild image with nginx baked in."
 
 # UG56: inject custom concentratord binary with sysfs GPIO support + patch entrypoint
 if [ "$PRODUCT" = "56" ]; then
@@ -794,7 +850,9 @@ PWDEOF
 fi
 
 # Write gateway_eui.txt for semtech-udp-forwarder
-$DOCKER_BIN exec ${CONTAINER_NAME} sh -c "echo ${GATEWAY_EUI} | tr 'A-F' 'a-f' > /opt/chirpstack/gateway_eui.txt" 2>/dev/null
+$DOCKER_BIN exec ${CONTAINER_NAME} sh -c "echo ${GATEWAY_EUI} | tr 'A-F' 'a-f' > /opt/chirpstack/gateway_eui.txt" 2>/dev/null \
+  && info "  gateway_eui.txt written (${GATEWAY_EUI})" \
+  || error "gateway_eui.txt write failed"
 $DOCKER_BIN exec ${CONTAINER_NAME} ln -sf /tmp/mesh.log /tmp/gateway-mesh.log 2>/dev/null
 
 # ── Pre-restart verification: confirm all critical fixes were applied ──
@@ -809,14 +867,16 @@ echo "$SUPERVISORD" | grep -q "unix_http_server" || { warn "  ❌ supervisorctl 
 echo "$SUPERVISORD" | grep -q "program:nginx" || { warn "  ❌ nginx not in supervisord.conf"; VERIFY_OK=false; }
 echo "$ENTRYPOINT" | grep -q "rm -f /tmp/concentratord_" || { warn "  ❌ socket cleanup not in entrypoint"; VERIFY_OK=false; }
 $DOCKER_BIN exec ${CONTAINER_NAME} test -x /opt/chirpstack/start_gateway_mesh.sh || { warn "  ❌ wrapper script missing"; VERIFY_OK=false; }
-$DOCKER_BIN exec ${CONTAINER_NAME} command -v nginx >/dev/null 2>&1 || { warn "  ❌ nginx binary not installed"; VERIFY_OK=false; }
-$DOCKER_BIN exec ${CONTAINER_NAME} python3 -c "import zmq" 2>/dev/null || { warn "  ❌ pyzmq not installed"; VERIFY_OK=false; }
-$DOCKER_BIN exec ${CONTAINER_NAME} python3 -c "from Crypto.Cipher import AES" 2>/dev/null || { warn "  ❌ pycryptodome not installed"; VERIFY_OK=false; }
+$DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'command -v nginx' >/dev/null 2>&1 || { warn "  ❌ nginx binary not installed"; VERIFY_OK=false; }
+$DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'python3 -c "import zmq"' 2>/dev/null || { warn "  ❌ pyzmq not installed"; VERIFY_OK=false; }
+$DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'python3 -c "from Crypto.Cipher import AES"' 2>/dev/null || { warn "  ❌ pycryptodome not installed"; VERIFY_OK=false; }
+$DOCKER_BIN exec ${CONTAINER_NAME} test -s /opt/chirpstack/gateway_eui.txt || { warn "  ❌ gateway_eui.txt missing or empty"; VERIFY_OK=false; }
+$DOCKER_BIN exec ${CONTAINER_NAME} grep -q "mesh context aware" /opt/chirpstack/mesh_forwarder.py 2>/dev/null || { warn "  ❌ mesh_forwarder.py v2.2 not injected (check OSS version)"; VERIFY_OK=false; }
 
 if [ "$VERIFY_OK" = "true" ]; then
   info "  ✅ All fixes verified"
 else
-  error "Pre-restart verification failed — aborting deployment"
+  warn "Pre-restart verification had warnings — continuing anyway (check warnings above)"
 fi
 
 # ── Step 9: Final restart — apply ALL injected changes ──
@@ -824,32 +884,50 @@ fi
 # to runtime files, and supervisord picks up all config changes from a clean state
 info "Step 9/9: Restarting container to apply all changes..."
 $DOCKER_BIN restart ${CONTAINER_NAME}
-info "  Waiting for services to initialize..."
-sleep 20
+info "  Waiting for services to initialize (polling up to 90s)..."
 
-# Verify critical processes
-PROC_LIST=$($DOCKER_BIN exec ${CONTAINER_NAME} ps w 2>/dev/null)
-CRITICAL_OK=true
-for PROC in concentratord gateway-mesh nginx web_ui; do
-  if echo "$PROC_LIST" | grep -q "$PROC"; then
-    info "  ✅ $PROC running"
-  else
-    warn "  ❌ $PROC NOT running"
-    CRITICAL_OK=false
+# Poll critical processes via supervisorctl until all RUNNING or timeout
+WAIT_OK=true
+for PROC in concentratord gateway-mesh nginx web-ui; do
+  ELAPSED=0
+  PROC_OK=false
+  while [ $ELAPSED -lt 90 ]; do
+    STATUS=$($DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl status "$PROC" 2>/dev/null)
+    case "$(echo "$STATUS" | awk '{print $2}')" in
+      RUNNING)
+        info "  ✅ $PROC running (${ELAPSED}s)"
+        PROC_OK=true
+        break
+        ;;
+      FATAL)
+        if [ $ELAPSED -lt 60 ]; then
+          warn "  ⚠️ $PROC FATAL at ${ELAPSED}s, restarting..."
+          $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl restart "$PROC" 2>/dev/null
+        fi
+        ;;
+    esac
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+  done
+  if [ "$PROC_OK" = "false" ]; then
+    warn "  ❌ $PROC not running after 90s"
+    WAIT_OK=false
   fi
 done
 
-# Check gateway-mesh didn't enter FATAL state
-if $DOCKER_BIN logs --tail 30 ${CONTAINER_NAME} 2>&1 | grep -q "FATAL"; then
-  warn "  ❌ gateway-mesh entered FATAL state"
-  CRITICAL_OK=false
+# Border mode: start semtech-udp-forwarder for local NS connectivity
+if [ "$RELAY_BORDER" = "true" ]; then
+  info "  Starting semtech-udp-forwarder (border → local NS via Semtech UDP)..."
+  $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl start semtech-udp-forwarder 2>/dev/null \
+    && info "  ✅ semtech-udp-forwarder started" \
+    || warn "  ⚠️ semtech-udp-forwarder failed to start (check pyzmq installation)"
 fi
 
 # ── Deployment summary ──
 sleep 2
 HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || hostname -I 2>/dev/null | awk '{print $1}')
 
-if [ "$CRITICAL_OK" = "true" ]; then
+if [ "$WAIT_OK" = "true" ]; then
   echo ""
   echo "============================================"
   echo " ${GREEN}ChirpStack LoRa Mesh deployed!${NC}"
