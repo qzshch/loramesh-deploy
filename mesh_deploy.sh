@@ -339,6 +339,18 @@ esac
 SX1302_RESET_GPIO=31
 info "Product=$PRODUCT, Band=${GW_BAND}MHz, concentratord reset=pin${SX1302_RESET_GPIO} (harmless)"
 
+# Hot-switch detection: some hwver can't init SX1302 from scratch via concentratord
+# (SPI returns chip version 0x00). Native pkt_fwd has Milesight board-specific init
+# that leaves hardware in a working state. For these, we kill pkt_fwd WITHOUT GPIO
+# reset and immediately start the container to inherit the initialized SPI bus.
+NEEDS_HOT_SWITCH=false
+case "$HWVER" in
+  0130) NEEDS_HOT_SWITCH=true ;;
+esac
+if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
+  warn "  hwver=$HWVER: hot-switch mode (skip GPIO reset, inherit pkt_fwd hardware init)"
+fi
+
 # UG56: download prerequisite files if missing
 if [ "$PRODUCT" = "56" ]; then
   UG56_BIN="/etc/chirpstack-concentratord-sx1302-sysfs"
@@ -358,11 +370,19 @@ fi
 # ── Step 5: Stop packet forwarder only (it's the only SPI holder) ──
 
 info "Step 5/9: Stopping native packet forwarder (SPI holder)..."
-if [ -f "/etc/init.d/lora_pkt_fwd" ]; then
-  /etc/init.d/lora_pkt_fwd stop 2>/dev/null && info "  Stopped lora_pkt_fwd" || true
-  /etc/init.d/lora_pkt_fwd disable 2>/dev/null && info "  Disabled lora_pkt_fwd auto-start" || true
+if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
+  # Hot-switch: just kill pkt_fwd, don't touch init.d or GPIO.
+  # The hardware stays initialized for the container to inherit.
+  killall -9 lora_pkt_fwd station 2>/dev/null || true
+  /etc/init.d/lora_pkt_fwd disable 2>/dev/null || true
+  info "  Hot-switch: pkt_fwd killed (GPIO untouched, hardware stays initialized)"
+else
+  if [ -f "/etc/init.d/lora_pkt_fwd" ]; then
+    /etc/init.d/lora_pkt_fwd stop 2>/dev/null && info "  Stopped lora_pkt_fwd" || true
+    /etc/init.d/lora_pkt_fwd disable 2>/dev/null && info "  Disabled lora_pkt_fwd auto-start" || true
+  fi
+  killall -9 lora_pkt_fwd station 2>/dev/null || true
 fi
-killall -9 lora_pkt_fwd station 2>/dev/null || true
 # Keep NS services running: loraserver, lora_app_server, lora_gateway_bridge, postgres
 sleep 2
 
@@ -381,6 +401,9 @@ info "  lora_pkt_fwd watchdog installed"
 # ── Step 6: Initialize GPIO ──
 
 info "Step 6/9: Initializing SX1302 GPIO..."
+if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
+  info "  Hot-switch: skipping GPIO init (preserving hardware state)"
+else
 # Unexport GPIOs BEFORE reset_lgw.sh (it re-exports them for reset)
 for GPIO_DIR in /sys/class/gpio/gpio*; do
   GPIO_NAME=$(basename "$GPIO_DIR" 2>/dev/null)
@@ -409,6 +432,7 @@ for GPIO_DIR in /sys/class/gpio/gpio*; do
   echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
 done
 info "  GPIO cleanup done"
+fi  # end hot-switch skip
 
 # ── Start built-in NS services BEFORE container (so web_ui can detect LGB) ──
 # If loraserver is running on host, start LGB + lora_app_server now.
@@ -550,6 +574,9 @@ DOCKER_OPTS="-d --name $CONTAINER_NAME --restart unless-stopped \
   -e DEBUG=INFO"
 
 # Final GPIO cleanup before main container launch
+if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
+  info "  Hot-switch: skipping pre-launch GPIO cleanup and SX1250 wait"
+else
 info "  Pre-launch GPIO cleanup..."
 for GPIO_DIR in /sys/class/gpio/gpio*; do
   GPIO_NAME=$(basename "$GPIO_DIR" 2>/dev/null)
@@ -565,6 +592,7 @@ done
 # on some hardware versions (especially after warm restarts).
 info "  Waiting 10s for SX1250 stabilization..."
 sleep 10
+fi  # end hot-switch skip for pre-launch
 
 $DOCKER_BIN run $DOCKER_OPTS ${IMAGE_NAME}
 sleep 3
@@ -588,6 +616,46 @@ $DOCKER_BIN exec ${CONTAINER_NAME} grep -q "program:nginx" /etc/supervisord.conf
 if [ "$VERIFY_OK" = "true" ]; then
   info "  ✅ All image components verified"
 fi
+
+# Fix mesh frequencies to match region (image default is EU868)
+info "  Setting mesh frequencies for $TMP_REGION..."
+$DOCKER_BIN exec ${CONTAINER_NAME} sed -i \
+  "s/frequencies=\[868100000,868300000,868500000\]/frequencies=[$DEFAULT_FREQS]/" \
+  /opt/chirpstack/mesh_config.toml 2>/dev/null && \
+  info "    mesh frequencies updated: $DEFAULT_FREQS" || \
+  warn "    mesh frequency update skipped (non-default config?)"
+
+# Inject nginx config (image default uses /etc/ssl_cert which doesn't exist)
+info "  Injecting nginx config..."
+$DOCKER_BIN exec ${CONTAINER_NAME} sh -c '
+cat > /etc/nginx/http.d/mesh.conf << "NGXEOF"
+server {
+    listen 8080;
+    server_name _;
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+server {
+    listen 8443 ssl;
+    server_name _;
+    ssl_certificate /etc/ssl_cert;
+    ssl_certificate_key /etc/ssl_key;
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+NGXEOF
+rm -f /etc/nginx/http.d/default.conf /etc/nginx/conf.d/default.conf
+' 2>/dev/null && info "    nginx config injected" || warn "    nginx config injection failed"
 
 # Sync MQTT credentials from host configs to mosquitto (host-level operation)
 if [ -f /etc/lora-gateway-bridge/lora-gateway-bridge.toml ] && command -v mosquitto_passwd >/dev/null 2>&1; then
@@ -707,6 +775,9 @@ info "Step 9/9: Restarting container to apply all changes..."
 # Stop container first (docker restart doesn't allow GPIO reset between stop/start)
 $DOCKER_BIN stop ${CONTAINER_NAME} >/dev/null 2>&1
 
+if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
+  info "  Hot-switch: skipping GPIO reset (preserving SPI bus state)"
+else
 # GPIO reset between stop and start — critical for SX1250 stability
 for GPIO_DIR in /sys/class/gpio/gpio*; do
   GPIO_NAME=$(basename "$GPIO_DIR" 2>/dev/null)
@@ -726,6 +797,7 @@ for GPIO_DIR in /sys/class/gpio/gpio*; do
   echo "$NUM" | grep -q '^[0-9][0-9]*$' || continue
   echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
 done
+fi  # end hot-switch skip for Step 9
 
 info "  Waiting 10s for SX1250 stabilization..."
 sleep 10
