@@ -135,22 +135,43 @@ if [ -z "$DOCKER_BIN" ] || ! $DOCKER_BIN info >/dev/null 2>&1; then
   if [ ! -f "$DOCKER_PROG" ]; then
     info "  docker_ctl install failed, doing manual extraction..."
     mkdir -p /overlay/docker/bin /usr/bin/docker
-    # Extract to root (tarball structure: usr/bin/docker/{docker,dockerd,...})
-    tar -xzf "${INSTALL_DIR}/docker.tgz" -C / 2>/dev/null
-    # Also copy to /overlay for persistence across reboots
-    cp -a /usr/bin/docker/* /overlay/docker/bin/ 2>/dev/null
-    # Handle flat tarball structure as fallback
-    if [ -d /overlay/docker/bin/docker ]; then
-      mv /overlay/docker/bin/docker/* /overlay/docker/bin/ 2>/dev/null
-      rmdir /overlay/docker/bin/docker 2>/dev/null
+    # BusyBox tar on some UG65 firmware silently fails on full extraction to overlay fs.
+    # Extract individual binaries to /tmp first, then copy (proven workaround).
+    _TAR_TMP="/tmp/docker_extract_$$"
+    mkdir -p "$_TAR_TMP"
+    tar -xzf "${INSTALL_DIR}/docker.tgz" -C "$_TAR_TMP" 2>/dev/null
+    _BIN_SRC=""
+    for _d in "$_TAR_TMP/usr/bin/docker" "$_TAR_TMP/usr/bin" "$_TAR_TMP"; do
+      if [ -f "$_d/dockerd" ]; then _BIN_SRC="$_d"; break; fi
+    done
+    if [ -n "$_BIN_SRC" ]; then
+      for _f in "$_BIN_SRC"/*; do
+        [ -f "$_f" ] || continue
+        _bn=$(basename "$_f")
+        cp "$_f" "/overlay/docker/bin/$_bn" 2>/dev/null && chmod +x "/overlay/docker/bin/$_bn"
+        cp "$_f" "/usr/bin/docker/$_bn" 2>/dev/null && chmod +x "/usr/bin/docker/$_bn"
+      done
+      info "  Extracted $(ls /overlay/docker/bin/ | wc -w) binaries via per-file copy"
+    else
+      # Last resort: extract to root (tarball structure: usr/bin/docker/...)
+      tar -xzf "${INSTALL_DIR}/docker.tgz" -C / 2>/dev/null
+      cp -a /usr/bin/docker/* /overlay/docker/bin/ 2>/dev/null
     fi
-    chmod +x /overlay/docker/bin/* /usr/bin/docker/* 2>/dev/null
+    rm -rf "$_TAR_TMP"
     touch /overlay/docker/bin/.docker_installed 2>/dev/null
 
     if [ ! -f "$DOCKER_PROG" ]; then
       error "Docker installation failed — dockerd not found after extraction. Check: tail -f /etc/urlog/system.log | grep docker"
     fi
     info "  Manual extraction succeeded"
+    # Create symlinks in /usr/bin so Docker binaries are in PATH
+    for _f in /overlay/docker/bin/*; do
+      [ -f "$_f" ] || continue
+      _bn=$(basename "$_f")
+      ln -sf "$_f" "/usr/bin/$_bn" 2>/dev/null
+    done
+    # Also symlink runc to /usr/sbin (some dockerd versions look there)
+    [ -f /overlay/docker/bin/runc ] && ln -sf /overlay/docker/bin/runc /usr/sbin/runc 2>/dev/null
   fi
 
   # Install docker-compose if present
@@ -160,6 +181,9 @@ if [ -z "$DOCKER_BIN" ] || ! $DOCKER_BIN info >/dev/null 2>&1; then
   fi
 
   info "  Starting Docker service..."
+  # CRITICAL: iptables needs libiptext.so which is not in default LD_LIBRARY_PATH.
+  # Without this, dockerd fails to create NAT chains and port mapping (-p) breaks.
+  export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/usr/lib/iptables"
   /etc/init.d/docker start
   sleep 10
 
@@ -177,6 +201,21 @@ if [ -z "$DOCKER_BIN" ] || ! $DOCKER_BIN info >/dev/null 2>&1; then
       sleep 5
     fi
   done
+
+  # Fallback: if init.d didn't start dockerd, start directly with LD_LIBRARY_PATH
+  if [ -z "$DOCKER_BIN" ] && [ -x "/overlay/docker/bin/dockerd" ]; then
+    warn "  init.d docker start failed, starting dockerd directly..."
+    killall dockerd containerd 2>/dev/null; sleep 2
+    LD_LIBRARY_PATH="$LD_LIBRARY_PATH" /overlay/docker/bin/dockerd \
+      --config-file /etc/docker/daemon.json >/tmp/dockerd.log 2>&1 &
+    sleep 10
+    for path in /overlay/docker/bin/docker /usr/bin/docker/docker; do
+      if [ -x "$path" ] && "$path" info >/dev/null 2>&1; then
+        DOCKER_BIN="$path"
+        break
+      fi
+    done
+  fi
 
   if [ -z "$DOCKER_BIN" ]; then
     # Last resort: check if docker binary exists but daemon not ready
