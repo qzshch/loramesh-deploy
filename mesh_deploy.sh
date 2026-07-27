@@ -394,6 +394,39 @@ MILESIGHT_BIN=""
 case "$HWVER" in
   0130|0150|0200) NEEDS_HOT_SWITCH=true ;;
 esac
+
+# ── Ensure PA marker files exist (race condition guard) ──
+# /tmp is tmpfs — wiped on reboot. Native pkt_fwd creates /tmp/newpa or /tmp/oldpa
+# during SX1302 init (reads GPIO 0x117). If gateway just rebooted, pkt_fwd may not
+# have finished init yet. Wait up to 30s for markers to appear.
+if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
+  if [ ! -f /tmp/newpa ] && [ ! -f /tmp/oldpa ]; then
+    info "  Waiting for native pkt_fwd PA detection (marker files)..."
+    # Ensure pkt_fwd is actually running
+    if ! pgrep -x lora_pkt_fwd >/dev/null 2>&1; then
+      warn "    pkt_fwd not running, starting it..."
+      /etc/init.d/lora_pkt_fwd start >/dev/null 2>&1 || true
+    fi
+    _PA_WAIT=0
+    while [ $_PA_WAIT -lt 30 ]; do
+      if [ -f /tmp/newpa ] || [ -f /tmp/oldpa ]; then
+        info "    PA marker appeared after ${_PA_WAIT}s"
+        break
+      fi
+      sleep 2
+      _PA_WAIT=$((_PA_WAIT + 2))
+      # Re-check pkt_fwd is alive (it may have crashed)
+      if ! pgrep -x lora_pkt_fwd >/dev/null 2>&1; then
+        warn "    pkt_fwd died during init, restarting..."
+        /etc/init.d/lora_pkt_fwd start >/dev/null 2>&1 || true
+      fi
+    done
+    if [ ! -f /tmp/newpa ] && [ ! -f /tmp/oldpa ]; then
+      warn "    Timeout: no PA marker after 30s, will use hwver fallback"
+    fi
+  fi
+fi
+
 if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
   warn "  hwver=$HWVER: hot-switch mode (skip GPIO reset, inherit pkt_fwd hardware init)"
 
