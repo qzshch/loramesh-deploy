@@ -384,16 +384,34 @@ info "Product=$PRODUCT, Band=${GW_BAND}MHz, concentratord reset=pin${SX1302_RESE
 # (SPI returns chip version 0x00). Native pkt_fwd has Milesight board-specific init
 # that leaves hardware in a working state. For these, we kill pkt_fwd WITHOUT GPIO
 # reset and immediately start the container to inherit the initialized SPI bus.
+#
+# Binary selection: based on native HAL's PA detection result (/tmp/newpa vs /tmp/oldpa)
+# rather than hwver alone, because the same hwver may have different BOM/PA circuits.
+# The native pkt_fwd reads SX1302 GPIO 0x117 and creates /tmp/newpa or /tmp/oldpa
+# during startup. We use this as the ground truth for PA configuration.
 NEEDS_HOT_SWITCH=false
 MILESIGHT_BIN=""
 case "$HWVER" in
-  # hwver=0130/0150: needs full_duplex=true (AD5338R DAC present, SX1250 init requires it)
-  0130|0150) NEEDS_HOT_SWITCH=true; MILESIGHT_BIN="$MILESIGHT_BIN_URL" ;;
-  # hwver=0200: MUST use full_duplex=false (AD5338R DAC absent, full_duplex=true causes TX hang)
-  0200) NEEDS_HOT_SWITCH=true; MILESIGHT_BIN="$MILESIGHT_NOFD_BIN_URL" ;;
+  0130|0150|0200) NEEDS_HOT_SWITCH=true ;;
 esac
 if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
   warn "  hwver=$HWVER: hot-switch mode (skip GPIO reset, inherit pkt_fwd hardware init)"
+
+  # Determine binary based on native HAL's PA detection result
+  if [ -f /tmp/newpa ]; then
+    MILESIGHT_BIN="$MILESIGHT_BIN_URL"
+    info "  PA detect: /tmp/newpa found → full_duplex=true binary (AD5338R DAC present)"
+  elif [ -f /tmp/oldpa ]; then
+    MILESIGHT_BIN="$MILESIGHT_NOFD_BIN_URL"
+    info "  PA detect: /tmp/oldpa found → full_duplex=false binary (no DAC, avoid TX hang)"
+  else
+    # Fallback: no marker files, use hwver as hint
+    warn "  PA detect: no marker files, falling back to hwver-based selection"
+    case "$HWVER" in
+      0200) MILESIGHT_BIN="$MILESIGHT_NOFD_BIN_URL"; warn "    hwver=0200 → nofd (safe default)" ;;
+      *)    MILESIGHT_BIN="$MILESIGHT_BIN_URL"; warn "    hwver=$HWVER → original" ;;
+    esac
+  fi
 fi
 if [ -n "$MILESIGHT_BIN" ]; then
   info "  Milesight custom concentratord binary will be injected"
@@ -705,12 +723,12 @@ NGXEOF
 rm -f /etc/nginx/http.d/default.conf /etc/nginx/conf.d/default.conf
 ' 2>/dev/null && info "    nginx config injected" || warn "    nginx config injection failed"
 
-# Inject Milesight custom concentratord binary (hwver-specific)
-# hwver=0130/0150: full_duplex=true (AD5338R DAC present, needed for SX1250 init)
-# hwver=0200: full_duplex=false (AD5338R DAC absent, full_duplex=true causes TX hang)
+# Inject Milesight custom concentratord binary (PA-based selection)
+# /tmp/newpa → full_duplex=true (AD5338R DAC present, needed for SX1250 init)
+# /tmp/oldpa → full_duplex=false (no DAC, full_duplex=true causes TX hang)
 if [ -n "$MILESIGHT_BIN" ]; then
-  info "  Injecting Milesight concentratord binary (hwver=$HWVER)..."
-  if [ "$HWVER" = "0200" ]; then
+  info "  Injecting Milesight concentratord binary..."
+  if [ "$MILESIGHT_BIN" = "$MILESIGHT_NOFD_BIN_URL" ]; then
     MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight-nofd"
   else
     MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight"
