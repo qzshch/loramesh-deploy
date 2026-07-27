@@ -387,17 +387,16 @@ info "Product=$PRODUCT, Band=${GW_BAND}MHz, concentratord reset=pin${SX1302_RESE
 NEEDS_HOT_SWITCH=false
 MILESIGHT_BIN=""
 case "$HWVER" in
-  # hwver=0130: GPIO 0x117=0x0D40, bits[5:4]=1 → newpa. full_duplex optional.
-  # hwver=0200: GPIO 0x117=0x0C00, bits[5:4]=0 → oldpa. full_duplex=true CAUSES TX HANG
-  #   (AD5338R I2C DAC not present, init failure leaves TX engine stuck at status 0x00).
-  # Use nofd binary (full_duplex=false) for ALL hot-switch variants — verified TX works on both.
-  0130|0200) NEEDS_HOT_SWITCH=true; MILESIGHT_BIN="$MILESIGHT_NOFD_BIN_URL" ;;
+  # hwver=0130/0150: needs full_duplex=true (AD5338R DAC present, SX1250 init requires it)
+  0130|0150) NEEDS_HOT_SWITCH=true; MILESIGHT_BIN="$MILESIGHT_BIN_URL" ;;
+  # hwver=0200: MUST use full_duplex=false (AD5338R DAC absent, full_duplex=true causes TX hang)
+  0200) NEEDS_HOT_SWITCH=true; MILESIGHT_BIN="$MILESIGHT_NOFD_BIN_URL" ;;
 esac
 if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
   warn "  hwver=$HWVER: hot-switch mode (skip GPIO reset, inherit pkt_fwd hardware init)"
 fi
 if [ -n "$MILESIGHT_BIN" ]; then
-  info "  Milesight custom concentratord binary (full_duplex=false) will be injected"
+  info "  Milesight custom concentratord binary will be injected"
 fi
 
 # UG56: download prerequisite files if missing
@@ -706,16 +705,20 @@ NGXEOF
 rm -f /etc/nginx/http.d/default.conf /etc/nginx/conf.d/default.conf
 ' 2>/dev/null && info "    nginx config injected" || warn "    nginx config injection failed"
 
-# Inject Milesight custom concentratord binary (full_duplex=false, safe for all hwver)
-# Verified: hwver=0130 TX works with both full_duplex=true/false
-#           hwver=0200 TX ONLY works with full_duplex=false (AD5338R DAC issue)
+# Inject Milesight custom concentratord binary (hwver-specific)
+# hwver=0130/0150: full_duplex=true (AD5338R DAC present, needed for SX1250 init)
+# hwver=0200: full_duplex=false (AD5338R DAC absent, full_duplex=true causes TX hang)
 if [ -n "$MILESIGHT_BIN" ]; then
-  info "  Injecting Milesight concentratord binary (full_duplex=false)..."
-  MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight-nofd"
+  info "  Injecting Milesight concentratord binary (hwver=$HWVER)..."
+  if [ "$HWVER" = "0200" ]; then
+    MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight-nofd"
+  else
+    MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight"
+  fi
   if [ ! -f "$MILESIGHT_LOCAL" ]; then
     download "$MILESIGHT_BIN" "$MILESIGHT_LOCAL" && \
       chmod +x "$MILESIGHT_LOCAL" && info "    downloaded to $MILESIGHT_LOCAL" || \
-      warn "    download failed, will try from WORK_DIR"
+      warn "    download failed"
   fi
   if [ -f "$MILESIGHT_LOCAL" ]; then
     $DOCKER_BIN cp "$MILESIGHT_LOCAL" ${CONTAINER_NAME}:/opt/chirpstack/binaries/chirpstack-concentratord-sx1302 && \
