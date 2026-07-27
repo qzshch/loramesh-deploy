@@ -873,6 +873,44 @@ for PROC in concentratord gateway-mesh nginx web-ui; do
   fi
 done
 
+# ── STANDBY_RC fallback: remove reset pin + hot-switch ──
+# Some hwver=0130 devices fail STANDBY_RC even with hot-switch because
+# concentratord's internal GPIO reset (pin 31) puts SX1250 in bad state.
+# Fix: remove sx1302_reset_pin from config + fresh hot-switch.
+CONC_STATUS=$($DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl status concentratord 2>/dev/null | awk '{print $2}')
+if [ "$CONC_STATUS" = "FATAL" ]; then
+  CONC_LOG=$($DOCKER_BIN exec ${CONTAINER_NAME} cat /tmp/mesh.log 2>/dev/null | tail -20)
+  if echo "$CONC_LOG" | grep -qi "STANDBY_RC\|lgw_start failed"; then
+    warn "  ⚠️ concentratord FATAL (STANDBY_RC detected). Applying fallback..."
+    info "    Removing sx1302_reset_pin from concentratord.toml..."
+    $DOCKER_BIN exec ${CONTAINER_NAME} sed -i '/sx1302_reset/d' /opt/chirpstack/concentratord.toml 2>/dev/null
+    info "    Fresh hot-switch: starting pkt_fwd to re-init hardware..."
+    /etc/init.d/lora_pkt_fwd start >/dev/null 2>&1
+    _HS_WAIT=0
+    while [ $_HS_WAIT -lt 20 ]; do
+      sleep 3; _HS_WAIT=$((_HS_WAIT + 3))
+      if tail -5 /etc/urlog/lora-pkt-fwd.log 2>/dev/null | grep -q "JSON up"; then
+        info "    Hardware re-initialized after ${_HS_WAIT}s"
+        break
+      fi
+    done
+    killall -9 lora_pkt_fwd 2>/dev/null || true
+    sleep 1
+    info "    Restarting concentratord (no reset pin, hot-switch inherited)..."
+    $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl start concentratord 2>/dev/null
+    sleep 10
+    CONC_STATUS2=$($DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl status concentratord 2>/dev/null | awk '{print $2}')
+    if [ "$CONC_STATUS2" = "RUNNING" ]; then
+      info "    ✅ concentratord running after STANDBY_RC fallback"
+      # Also restart gateway-mesh since it depends on concentratord
+      $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl restart gateway-mesh 2>/dev/null
+      WAIT_OK=true
+    else
+      warn "    ❌ concentratord still not running after fallback"
+    fi
+  fi
+fi
+
 # Border mode: start semtech-udp-forwarder for local NS connectivity
 if [ "$RELAY_BORDER" = "true" ]; then
   info "  Starting semtech-udp-forwarder (border → local NS via Semtech UDP)..."
