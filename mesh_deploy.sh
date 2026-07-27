@@ -11,6 +11,8 @@ OSS_BASE="https://ursalink-resource-center.oss-us-west-1.aliyuncs.com/kevin"
 IMAGE_URL="${OSS_BASE}/chirpstack-mesh-gw.tar.gz"
 DOCKER_URL="${OSS_BASE}/docker.tgz"
 COMPOSE_URL="${OSS_BASE}/docker-compose.tgz"
+MILESIGHT_BIN_URL="${OSS_BASE}/chirpstack-concentratord-sx1302-milesight"
+MILESIGHT_NOFD_BIN_URL="${OSS_BASE}/chirpstack-concentratord-sx1302-milesight-nofd"
 IMAGE_NAME="chirpstack-mesh-gw"
 CONTAINER_NAME="chirpstack-mesh"
 WORK_DIR="/tmp/mesh-deploy"
@@ -383,11 +385,16 @@ info "Product=$PRODUCT, Band=${GW_BAND}MHz, concentratord reset=pin${SX1302_RESE
 # that leaves hardware in a working state. For these, we kill pkt_fwd WITHOUT GPIO
 # reset and immediately start the container to inherit the initialized SPI bus.
 NEEDS_HOT_SWITCH=false
+MILESIGHT_BIN=""
 case "$HWVER" in
-  0130) NEEDS_HOT_SWITCH=true ;;
+  0130) NEEDS_HOT_SWITCH=true; MILESIGHT_BIN="$MILESIGHT_BIN_URL" ;;
+  0200) NEEDS_HOT_SWITCH=true; MILESIGHT_BIN="$MILESIGHT_NOFD_BIN_URL" ;;
 esac
 if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
   warn "  hwver=$HWVER: hot-switch mode (skip GPIO reset, inherit pkt_fwd hardware init)"
+fi
+if [ -n "$MILESIGHT_BIN" ]; then
+  info "  Milesight custom concentratord binary will be injected"
 fi
 
 # UG56: download prerequisite files if missing
@@ -695,6 +702,30 @@ server {
 NGXEOF
 rm -f /etc/nginx/http.d/default.conf /etc/nginx/conf.d/default.conf
 ' 2>/dev/null && info "    nginx config injected" || warn "    nginx config injection failed"
+
+# Inject Milesight custom concentratord binary (hwver-specific)
+# hwver=0130/0150: full_duplex=true (external PA via RADIO_CTRL[3])
+# hwver=0200: full_duplex=false (AD5338R DAC not present, full_duplex=true causes TX hang)
+if [ -n "$MILESIGHT_BIN" ]; then
+  info "  Injecting Milesight concentratord binary (hwver=$HWVER)..."
+  MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight"
+  if [ "$HWVER" = "0200" ]; then
+    MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight-nofd"
+  fi
+  if [ ! -f "$MILESIGHT_LOCAL" ]; then
+    download "$MILESIGHT_BIN" "$MILESIGHT_LOCAL" && \
+      chmod +x "$MILESIGHT_LOCAL" && info "    downloaded to $MILESIGHT_LOCAL" || \
+      warn "    download failed, will try docker cp from WORK_DIR"
+  fi
+  if [ -f "$MILESIGHT_LOCAL" ]; then
+    $DOCKER_BIN cp "$MILESIGHT_LOCAL" ${CONTAINER_NAME}:/opt/chirpstack/binaries/chirpstack-concentratord-sx1302 && \
+      $DOCKER_BIN exec ${CONTAINER_NAME} chmod +x /opt/chirpstack/binaries/chirpstack-concentratord-sx1302 && \
+      info "    Milesight binary injected" || warn "    injection failed"
+  fi
+  # Remove sx1302_reset_pin from concentratord.toml (hot-switch handles reset externally)
+  $DOCKER_BIN exec ${CONTAINER_NAME} sed -i '/sx1302_reset/d' /opt/chirpstack/concentratord.toml 2>/dev/null && \
+    info "    reset pin removed from config" || true
+fi
 
 # Sync MQTT credentials from host configs to mosquitto (host-level operation)
 if [ -f /etc/lora-gateway-bridge/lora-gateway-bridge.toml ] && command -v mosquitto_passwd >/dev/null 2>&1; then
