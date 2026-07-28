@@ -488,12 +488,50 @@ sleep 2
 # Install lora_pkt_fwd watchdog via cron — kills native pkt_fwd if re-enabled while mesh runs
 info "  Installing lora_pkt_fwd watchdog (cron, every 1 min)..."
 WATCHDOG_CRON='* * * * * [ -f /tmp/.mesh_container_running ] && pgrep -x lora_pkt_fwd >/dev/null && { /etc/init.d/lora_pkt_fwd stop; killall -9 lora_pkt_fwd; } 2>/dev/null'
-# Use file-based crontab install (pipe `| crontab -` hangs on some BusyBox firmware)
-CRON_TMP="${WORK_DIR}/crontab_tmp"
-(crontab -l 2>/dev/null | grep -v mesh_container_running; echo "$WATCHDOG_CRON") > "$CRON_TMP" 2>/dev/null
-crontab "$CRON_TMP" 2>/dev/null && info "    crontab installed via file" || warn "    crontab install failed (watchdog disabled)"
-rm -f "$CRON_TMP"
-/etc/init.d/cron enable 2>/dev/null || true
+
+# Method 1: Direct write to crontab file (most reliable on BusyBox)
+# BusyBox stores crontabs at /etc/crontabs/root or /var/spool/cron/crontabs/root
+CRONTAB_FILE=""
+for _cf in /etc/crontabs/root /var/spool/cron/crontabs/root; do
+  if [ -f "$_cf" ] || [ -d "$(dirname "$_cf")" ]; then
+    CRONTAB_FILE="$_cf"
+    break
+  fi
+done
+
+WATCHDOG_INSTALLED=false
+if [ -n "$CRONTAB_FILE" ]; then
+  # Remove old watchdog line, add new one
+  grep -v 'mesh_container_running' "$CRONTAB_FILE" 2>/dev/null > "${CRONTAB_FILE}.tmp" || true
+  echo "$WATCHDOG_CRON" >> "${CRONTAB_FILE}.tmp"
+  mv "${CRONTAB_FILE}.tmp" "$CRONTAB_FILE"
+  chmod 600 "$CRONTAB_FILE"
+  # Verify
+  if grep -q 'mesh_container_running' "$CRONTAB_FILE" 2>/dev/null; then
+    WATCHDOG_INSTALLED=true
+    info "    watchdog installed via direct write ($CRONTAB_FILE)"
+  fi
+fi
+
+# Method 2: Fallback to crontab command with timeout (prevents pipe hang)
+if [ "$WATCHDOG_INSTALLED" = "false" ]; then
+  CRON_TMP="${WORK_DIR}/crontab_tmp"
+  # Use timeout to prevent crontab -l from hanging
+  (timeout 5 crontab -l 2>/dev/null | grep -v mesh_container_running; echo "$WATCHDOG_CRON") > "$CRON_TMP" 2>/dev/null
+  if crontab "$CRON_TMP" 2>/dev/null; then
+    if timeout 3 crontab -l 2>/dev/null | grep -q 'mesh_container_running'; then
+      WATCHDOG_INSTALLED=true
+      info "    watchdog installed via crontab command"
+    fi
+  fi
+  rm -f "$CRON_TMP"
+fi
+
+if [ "$WATCHDOG_INSTALLED" = "false" ]; then
+  warn "    ⚠️ watchdog install FAILED — native pkt_fwd may respawn!"
+fi
+
+/etc/init.d/cron restart 2>/dev/null || /etc/init.d/cron enable 2>/dev/null || true
 touch /tmp/.mesh_container_running
 info "  lora_pkt_fwd watchdog installed"
 
