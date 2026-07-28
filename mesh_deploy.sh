@@ -469,9 +469,19 @@ fi
 # ── Step 5: Stop packet forwarder only (it's the only SPI holder) ──
 
 info "Step 5/9: Stopping native packet forwarder (SPI holder)..."
-if [ -f "/etc/init.d/lora_pkt_fwd" ]; then
-  /etc/init.d/lora_pkt_fwd stop 2>/dev/null && info "  Stopped lora_pkt_fwd" || true
-  /etc/init.d/lora_pkt_fwd disable 2>/dev/null && info "  Disabled lora_pkt_fwd auto-start" || true
+if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
+  # Hot-switch: kill pkt_fwd with SIGKILL to preserve SX1250 hardware state.
+  # SIGTERM (init.d stop) triggers pkt_fwd clean shutdown which resets SX1250
+  # to STANDBY_RC, causing concentratord init to fail.
+  killall -9 lora_pkt_fwd station 2>/dev/null || true
+  /etc/init.d/lora_pkt_fwd disable 2>/dev/null || true
+  info "  Hot-switch: pkt_fwd killed (SIGKILL, GPIO untouched)"
+else
+  # Non-hot-switch: init.d stop is safe (no STANDBY_RC issue on these hwver)
+  if [ -f "/etc/init.d/lora_pkt_fwd" ]; then
+    /etc/init.d/lora_pkt_fwd stop 2>/dev/null && info "  Stopped lora_pkt_fwd" || true
+    /etc/init.d/lora_pkt_fwd disable 2>/dev/null && info "  Disabled lora_pkt_fwd auto-start" || true
+  fi
 fi
 # Keep NS services running: loraserver, lora_app_server, lora_gateway_bridge, postgres
 sleep 2
@@ -958,7 +968,7 @@ if [ "$CONC_STATUS" = "FATAL" ]; then
         break
       fi
     done
-    /etc/init.d/lora_pkt_fwd stop 2>/dev/null || true
+    killall -9 lora_pkt_fwd 2>/dev/null || true
     sleep 1
     info "    Restarting concentratord (no reset pin, hot-switch inherited)..."
     $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl start concentratord 2>/dev/null
