@@ -24,7 +24,7 @@ if [ -z "$DOCKER_BIN" ]; then
 fi
 
 # ── Step 1: Stop and remove container + image ──
-info "Step 1/5: Removing mesh container and image..."
+info "Step 1/4: Removing mesh container and image..."
 if $DOCKER_BIN ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
   $DOCKER_BIN rm -f "$CONTAINER_NAME" 2>/dev/null && info "  Container removed" || warn "  Failed to remove container"
 else
@@ -38,7 +38,7 @@ if [ -n "$MESH_IMG" ]; then
 fi
 
 # ── Step 2: Stop services ──
-info "Step 2/5: Stopping services..."
+info "Step 2/4: Stopping services..."
 if [ -f /etc/init.d/mesh_pwd_sync ]; then
   /etc/init.d/mesh_pwd_sync stop 2>/dev/null
   rm -f /etc/init.d/mesh_pwd_sync
@@ -46,7 +46,7 @@ if [ -f /etc/init.d/mesh_pwd_sync ]; then
 fi
 
 # ── Step 3: Clean up all mesh-related files ──
-info "Step 3/5: Cleaning up files..."
+info "Step 3/4: Cleaning up files..."
 for f in \
   /etc/chirpstack-concentratord-sx1302-sysfs \
   /etc/ug56_patch.sh \
@@ -60,21 +60,8 @@ done
 rm -rf /tmp/mesh-deploy 2>/dev/null
 info "  Temp files cleaned"
 
-# ── Step 4: Remove pkt_fwd watchdog ──
-info "Step 4/5: Removing watchdog..."
-if [ -f "/etc/init.d/mesh_pkt_fwd_guard" ]; then
-    /etc/init.d/mesh_pkt_fwd_guard stop 2>/dev/null
-    /etc/init.d/mesh_pkt_fwd_guard disable 2>/dev/null
-    rm -f /etc/init.d/mesh_pkt_fwd_guard
-    info "  Removed pkt_fwd guard service"
-fi
-# Remove cron watchdog
-(crontab -l 2>/dev/null | grep -v mesh_container_running) > /tmp/crontab_clean 2>/dev/null
-crontab /tmp/crontab_clean 2>/dev/null
-rm -f /tmp/crontab_clean
-
-# ── Step 5: Restart native packet forwarder ──
-info "Step 5/5: Restoring native packet forwarder..."
+# ── Step 4: Restart native packet forwarder ──
+info "Step 4/4: Restoring native packet forwarder..."
 RESTARTED=0
 
 if [ -f "/etc/init.d/lora_pkt_fwd" ]; then
