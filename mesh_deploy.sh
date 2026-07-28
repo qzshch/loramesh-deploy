@@ -473,9 +473,14 @@ if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
   # Hot-switch: kill pkt_fwd with SIGKILL to preserve SX1250 hardware state.
   # SIGTERM (init.d stop) triggers pkt_fwd clean shutdown which resets SX1250
   # to STANDBY_RC, causing concentratord init to fail.
+  #
+  # init.d has "procd_set_param respawn retry=10000" — procd WILL restart
+  # pkt_fwd after SIGKILL. Use ubus to delete the procd service registration
+  # (does NOT trigger stop_service callback, so GPIO stays untouched).
   killall -9 lora_pkt_fwd station 2>/dev/null || true
+  ubus call service delete '{"name":"lora_pkt_fwd"}' 2>/dev/null || true
   /etc/init.d/lora_pkt_fwd disable 2>/dev/null || true
-  info "  Hot-switch: pkt_fwd killed (SIGKILL, GPIO untouched)"
+  info "  Hot-switch: pkt_fwd killed (SIGKILL + procd deregistered)"
 else
   # Non-hot-switch: init.d stop is safe (no STANDBY_RC issue on these hwver)
   if [ -f "/etc/init.d/lora_pkt_fwd" ]; then
@@ -969,6 +974,7 @@ if [ "$CONC_STATUS" = "FATAL" ]; then
       fi
     done
     killall -9 lora_pkt_fwd 2>/dev/null || true
+    ubus call service delete '{"name":"lora_pkt_fwd"}' 2>/dev/null || true
     sleep 1
     info "    Restarting concentratord (no reset pin, hot-switch inherited)..."
     $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl start concentratord 2>/dev/null
