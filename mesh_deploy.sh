@@ -372,36 +372,64 @@ if [ -n "$OLD_IMG" ]; then
   $DOCKER_BIN rmi -f "$OLD_IMG" 2>/dev/null || true
 fi
 
-# Download image if not cached locally
-if [ ! -f "${WORK_DIR}/chirpstack-mesh-gw.tar.gz" ]; then
-  download "$IMAGE_URL" "${WORK_DIR}/chirpstack-mesh-gw.tar.gz" || error "Docker image download failed"
+IMAGE_TGZ="${WORK_DIR}/chirpstack-mesh-gw.tar.gz"
+MIN_IMAGE_SIZE=20000000
+
+# A cached tarball from an interrupted run is often truncated and makes
+# `docker load` fail with "unexpected EOF". Validate before trusting it.
+if [ -f "$IMAGE_TGZ" ]; then
+  _ISZ=$(wc -c < "$IMAGE_TGZ" 2>/dev/null || echo 0)
+  if [ "$_ISZ" -lt "$MIN_IMAGE_SIZE" ] 2>/dev/null || ! gzip -t "$IMAGE_TGZ" 2>/dev/null; then
+    warn "  Cached image is truncated/corrupt (${_ISZ} bytes) — re-downloading"
+    rm -f "$IMAGE_TGZ"
+  else
+    info "  Using cached image (${_ISZ} bytes)"
+  fi
 fi
 
-# Load image — handle "max depth exceeded" by cleaning overlay2 storage
+if [ ! -f "$IMAGE_TGZ" ]; then
+  download "$IMAGE_URL" "$IMAGE_TGZ" || { rm -f "$IMAGE_TGZ"; error "Docker image download failed"; }
+  _ISZ=$(wc -c < "$IMAGE_TGZ" 2>/dev/null || echo 0)
+  if [ "$_ISZ" -lt "$MIN_IMAGE_SIZE" ] 2>/dev/null || ! gzip -t "$IMAGE_TGZ" 2>/dev/null; then
+    rm -f "$IMAGE_TGZ"
+    error "Downloaded image is corrupt (${_ISZ} bytes). Check connectivity to ${OSS_BASE}"
+  fi
+fi
+
 _load_image() {
-  $DOCKER_BIN load -i "${WORK_DIR}/chirpstack-mesh-gw.tar.gz" 2>&1
+  $DOCKER_BIN load -i "$IMAGE_TGZ" 2>&1
 }
 LOAD_OUT=$(_load_image)
-if echo "$LOAD_OUT" | grep -qi "max depth\|error"; then
+# Only wipe overlay2 for genuine storage-driver problems. A corrupt tarball
+# ("unexpected EOF", "invalid tar header") is not fixed by deleting storage —
+# and wiping it would destroy any other containers on the gateway.
+if echo "$LOAD_OUT" | grep -qi "max depth\|too many links\|no space left"; then
   warn "  Docker overlay2 depth limit reached — cleaning storage..."
   $DOCKER_BIN stop $($DOCKER_BIN ps -aq) 2>/dev/null || true
   $DOCKER_BIN rm -f $($DOCKER_BIN ps -aq) 2>/dev/null || true
-  # Stop Docker, clean overlay2, restart
   /etc/init.d/docker stop 2>/dev/null
   sleep 3
   rm -rf /overlay/docker/overlay2 /overlay/docker/image /overlay/docker/containers
   /etc/init.d/docker start 2>/dev/null
   sleep 5
-  # Re-find docker binary (path may change after restart)
   DOCKER_BIN=""
   for d in /usr/bin/docker/docker /overlay/docker/bin/docker; do
     [ -x "$d" ] && DOCKER_BIN="$d" && break
   done
   [ -z "$DOCKER_BIN" ] && command -v docker >/dev/null 2>&1 && DOCKER_BIN="docker"
   [ -z "$DOCKER_BIN" ] && error "Docker not available after restart"
-  # Retry load
   LOAD_OUT=$(_load_image)
   echo "$LOAD_OUT" | grep -qi "error" && error "Docker image load failed after overlay2 cleanup: $LOAD_OUT"
+elif echo "$LOAD_OUT" | grep -qi "unexpected EOF\|invalid tar\|gzip"; then
+  # Corrupt archive: drop it and retry once with a fresh copy
+  warn "  Image archive corrupt — re-downloading and retrying load..."
+  rm -f "$IMAGE_TGZ"
+  download "$IMAGE_URL" "$IMAGE_TGZ" || error "Image re-download failed"
+  gzip -t "$IMAGE_TGZ" 2>/dev/null || error "Re-downloaded image still corrupt — check connectivity"
+  LOAD_OUT=$(_load_image)
+  echo "$LOAD_OUT" | grep -qi "error" && error "Docker image load failed: $LOAD_OUT"
+elif echo "$LOAD_OUT" | grep -qi "error"; then
+  error "Docker image load failed: $LOAD_OUT"
 fi
 
 # Ensure image has :latest tag (tarball may have version tag like v4-stable)
