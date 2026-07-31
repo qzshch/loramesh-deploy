@@ -553,7 +553,7 @@ const httpServer = http.createServer((req, res) => {
   res.end('Not found');
 });
 
-httpServer.listen(CONFIG_PORT, () => {
+httpServer.listen(CONFIG_PORT, '0.0.0.0', () => {
   console.log(`Config UI: http://0.0.0.0:${CONFIG_PORT}`);
 });
 
