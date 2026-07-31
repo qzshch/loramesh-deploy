@@ -117,16 +117,26 @@ sx1302_hw_reset() {
 # init.d has "respawn retry=10000" → procd restarts it after SIGKILL unless the
 # service registration is deleted via ubus.
 stop_pkt_fwd() {
-  killall -9 lora_pkt_fwd station 2>/dev/null || true
-  ubus call service delete '{"name":"lora_pkt_fwd"}' 2>/dev/null || true
+  # init.d has "respawn retry=10000"; procd restarts pkt_fwd after SIGKILL
+  # unless the service registration is deleted. Order matters: disable first so
+  # a re-registration during our work does not auto-start it.
   /etc/init.d/lora_pkt_fwd disable 2>/dev/null || true
+  ubus call service delete '{"name":"lora_pkt_fwd"}' 2>/dev/null || true
+  killall -9 lora_pkt_fwd station 2>/dev/null || true
   sleep 2
-  if proc_running lora_pkt_fwd; then
-    warn "  pkt_fwd still alive after SIGKILL+ubus delete, retrying..."
+  # procd may re-register between our delete and now — keep knocking it down
+  _PF_TRY=0
+  while proc_running lora_pkt_fwd && [ "$_PF_TRY" -lt 5 ]; do
+    ubus call service delete '{"name":"lora_pkt_fwd"}' 2>/dev/null || true
     killall -9 lora_pkt_fwd 2>/dev/null || true
     sleep 2
+    _PF_TRY=$((_PF_TRY + 1))
+  done
+  if proc_running lora_pkt_fwd; then
+    warn "  pkt_fwd could not be stopped after ${_PF_TRY} attempts — it holds SPI, radio will fail"
+  else
+    info "  Native pkt_fwd stopped and disabled"
   fi
-  proc_running lora_pkt_fwd && warn "  pkt_fwd could not be stopped" || info "  Native pkt_fwd stopped and disabled"
 }
 
 # ── Parse arguments ──
@@ -1028,6 +1038,13 @@ info "Step 9/9: Restarting container to apply all changes..."
 # Stop container first (docker restart doesn't allow a hardware reset in between)
 $DOCKER_BIN stop ${CONTAINER_NAME} >/dev/null 2>&1
 
+# pkt_fwd may have been respawned by procd during Steps 7-8; it would hold SPI
+# and leave SX1250 unreachable after the reset.
+if proc_running lora_pkt_fwd; then
+  warn "  pkt_fwd respawned during deployment — stopping it again"
+  stop_pkt_fwd
+fi
+
 # Hardware reset between stop and start — SX1250 must be reset from a state where
 # nothing holds the SPI bus, otherwise it stays in SLEEP and STANDBY_RC fails.
 sx1302_hw_reset
@@ -1096,15 +1113,61 @@ if [ "$CONC_STATUS" = "FATAL" ] || echo "$CONC_LOG" | grep -qi "failed STANDBY_R
   fi
 fi
 
-# ── Verify AGC firmware started (M33) ──
-# A healthy cold start shows no AGC errors. "FDD mode ... not been set properly"
-# means the deployed binary predates the mailbox-2 fix.
-AGC_ERR=$($DOCKER_BIN exec ${CONTAINER_NAME} sh -c "tail -200 /tmp/mesh.log 2>/dev/null | grep -c 'FDD mode of Radio\|failed to start AGC firmware'" 2>/dev/null)
-if [ -n "$AGC_ERR" ] && [ "$AGC_ERR" -gt 0 ] 2>/dev/null; then
-  warn "  ⚠️ AGC firmware errors detected — concentratord binary may be outdated"
-  warn "     Expected: cold-start binary with AGC mailbox-2 fix (M33)"
+# ── Verify the radio actually came up (M33) ──
+# supervisorctl RUNNING is NOT sufficient: concentratord stays alive after
+# lgw_start() fails, so a gateway can show 4/4 processes running with a dead
+# radio (SX1250 in SLEEP, Gateway ID all-zero, rx_received=0 forever).
+RADIO_OK=true
+RADIO_LOG=$($DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'tail -300 /tmp/mesh.log 2>/dev/null' 2>/dev/null)
+
+if echo "$RADIO_LOG" | grep -q "failed STANDBY_RC\|lgw_start failed"; then
+  warn "  ❌ SX1250 did not wake (STANDBY_RC status 0x00) — radio is dead"
+  RADIO_OK=false
+fi
+if echo "$RADIO_LOG" | grep -q "FDD mode of Radio\|failed to start AGC firmware"; then
+  warn "  ❌ AGC firmware errors — concentratord binary may predate the mailbox-2 fix (M33)"
+  RADIO_OK=false
+fi
+
+# Gateway ID of all zeros (or the 0x05 repeat pattern) means OTP read failed,
+# which only happens when lgw_start() did not complete.
+GW_ID=$($DOCKER_BIN exec ${CONTAINER_NAME} sh -c "grep -a 'Gateway ID retrieved' /tmp/mesh.log 2>/dev/null | tail -1" 2>/dev/null | grep -oE '[0-9a-f]{16}' | tail -1)
+case "$GW_ID" in
+  0000000000000000|0505050505050505)
+    warn "  ❌ Invalid Gateway ID ($GW_ID) — SX1302 OTP not readable, lgw_start incomplete"
+    RADIO_OK=false ;;
+  "") warn "  ⚠️ Gateway ID not found in log yet" ;;
+  *)  info "  Gateway ID: $GW_ID" ;;
+esac
+
+if [ "$RADIO_OK" = "true" ]; then
+  info "  ✅ Radio initialized (SX1250 awake, AGC clean, valid Gateway ID)"
 else
-  info "  ✅ AGC firmware started cleanly (no FDD/mailbox errors)"
+  # Almost always caused by something else holding SPI/GPIO — usually procd
+  # having respawned pkt_fwd. Retry the whole cold start once.
+  warn "  Attempting radio recovery..."
+  if proc_running lora_pkt_fwd; then
+    warn "    pkt_fwd is running again (procd respawn) — stopping it"
+  fi
+  $DOCKER_BIN stop ${CONTAINER_NAME} >/dev/null 2>&1
+  stop_pkt_fwd
+  sx1302_hw_reset
+  sleep 5
+  $DOCKER_BIN start ${CONTAINER_NAME} >/dev/null 2>&1
+  info "    Waiting 40s for concentratord..."
+  sleep 40
+  RADIO_LOG2=$($DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'tail -200 /tmp/mesh.log 2>/dev/null' 2>/dev/null)
+  GW_ID2=$($DOCKER_BIN exec ${CONTAINER_NAME} sh -c "grep -a 'Gateway ID retrieved' /tmp/mesh.log 2>/dev/null | tail -1" 2>/dev/null | grep -oE '[0-9a-f]{16}' | tail -1)
+  if echo "$RADIO_LOG2" | grep -q "failed STANDBY_RC" || \
+     [ "$GW_ID2" = "0000000000000000" ] || [ "$GW_ID2" = "0505050505050505" ]; then
+    warn "  ❌ Radio still dead after recovery (Gateway ID: ${GW_ID2:-none})"
+    warn "     Check that nothing else holds SPI: ps w | grep lora_pkt_fwd"
+    WAIT_OK=false
+  else
+    info "  ✅ Radio recovered (Gateway ID: $GW_ID2)"
+    $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl restart gateway-mesh 2>/dev/null
+    sleep 5
+  fi
 fi
 
 # Border mode: connect to the built-in NS.
