@@ -576,27 +576,39 @@ info "  Cold-start binary (auto PA/duplex detect) — hwver=${HWVER:-unknown}"
 # rather than leave a half-broken deployment behind.
 MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight-coldstart"
 MIN_BIN_SIZE=1000000
-if [ -f "$MILESIGHT_LOCAL" ]; then
-  _SZ=$(wc -c < "$MILESIGHT_LOCAL" 2>/dev/null || echo 0)
-  [ "$_SZ" -lt "$MIN_BIN_SIZE" ] 2>/dev/null && { warn "  cached binary truncated (${_SZ}B), re-downloading"; rm -f "$MILESIGHT_LOCAL"; }
-fi
-if [ ! -f "$MILESIGHT_LOCAL" ]; then
-  info "  Downloading cold-start concentratord (~5 MB)..."
-  download "$MILESIGHT_BIN" "$MILESIGHT_LOCAL" || rm -f "$MILESIGHT_LOCAL"
+
+# Always fetch a fresh copy. A cached file is NOT trustworthy: gateways
+# accumulate binaries from earlier sessions, and a stale one silently
+# reintroduces old bugs (an M30-era build left SX1250 asleep on a gateway that
+# had been working). Size alone cannot distinguish builds. Only fall back to
+# the cache if the download fails outright.
+info "  Downloading cold-start concentratord (~5 MB)..."
+_FRESH="${WORK_DIR}/coldstart.bin"
+rm -f "$_FRESH"
+if download "$MILESIGHT_BIN" "$_FRESH"; then
+  _SZ=$(wc -c < "$_FRESH" 2>/dev/null || echo 0)
+  if [ "$_SZ" -lt "$MIN_BIN_SIZE" ] 2>/dev/null; then
+    rm -f "$_FRESH"
+    error "Cold-start concentratord download truncated (${_SZ} bytes). Check connectivity to ${OSS_BASE}"
+  fi
+  if [ -f "$MILESIGHT_LOCAL" ] && ! cmp -s "$_FRESH" "$MILESIGHT_LOCAL" 2>/dev/null; then
+    warn "  Cached binary differs from OSS — replacing stale copy"
+  fi
+  mv -f "$_FRESH" "$MILESIGHT_LOCAL"
+  chmod +x "$MILESIGHT_LOCAL"
+  info "  Cold-start binary ready (${_SZ} bytes)"
+else
+  rm -f "$_FRESH"
   _SZ=$(wc -c < "$MILESIGHT_LOCAL" 2>/dev/null || echo 0)
   if [ "$_SZ" -lt "$MIN_BIN_SIZE" ] 2>/dev/null; then
-    rm -f "$MILESIGHT_LOCAL"
-    error "Cold-start concentratord download failed (got ${_SZ} bytes).
+    error "Cold-start concentratord download failed and no usable cache exists.
        Without it concentratord panics: 'unexpected gateway model: milesight_ug65'.
        Nothing has been changed on this gateway — fix connectivity to
        ${OSS_BASE} and re-run, or place the binary at:
        ${MILESIGHT_LOCAL}"
   fi
+  warn "  Download failed — falling back to cached binary (${_SZ} bytes, may be outdated)"
   chmod +x "$MILESIGHT_LOCAL"
-  info "  Cold-start binary ready (${_SZ} bytes)"
-else
-  _SZ=$(wc -c < "$MILESIGHT_LOCAL")
-  info "  Cold-start binary cached (${_SZ} bytes)"
 fi
 
 # UG56: download prerequisite files if missing
@@ -873,28 +885,10 @@ rm -f /etc/nginx/http.d/default.conf /etc/nginx/conf.d/default.conf
 # panics with `unexpected gateway model: milesight_ug65`. If the injection can't
 # be completed, fail loudly rather than leaving a broken deployment behind.
 if [ -n "$MILESIGHT_BIN" ]; then
-  info "  Injecting Milesight cold-start concentratord binary (~5 MB)..."
-  MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight-coldstart"
-  MIN_BIN_SIZE=1000000
-
-  # Discard a truncated/failed cached copy from a previous run
-  if [ -f "$MILESIGHT_LOCAL" ]; then
-    _SZ=$(wc -c < "$MILESIGHT_LOCAL" 2>/dev/null || echo 0)
-    [ "$_SZ" -lt "$MIN_BIN_SIZE" ] 2>/dev/null && { warn "    cached binary truncated (${_SZ}B), re-downloading"; rm -f "$MILESIGHT_LOCAL"; }
-  fi
-
-  if [ ! -f "$MILESIGHT_LOCAL" ]; then
-    download "$MILESIGHT_BIN" "$MILESIGHT_LOCAL" || rm -f "$MILESIGHT_LOCAL"
-    _SZ=$(wc -c < "$MILESIGHT_LOCAL" 2>/dev/null || echo 0)
-    if [ "$_SZ" -lt "$MIN_BIN_SIZE" ] 2>/dev/null; then
-      rm -f "$MILESIGHT_LOCAL"
-      error "Cold-start concentratord download failed (got ${_SZ} bytes). Without it concentratord panics on model milesight_ug65. Check network access to ${OSS_BASE}"
-    fi
-    chmod +x "$MILESIGHT_LOCAL"
-    info "    downloaded ${_SZ} bytes to $MILESIGHT_LOCAL"
-  else
-    info "    using cached $(wc -c < "$MILESIGHT_LOCAL") bytes"
-  fi
+  info "  Injecting Milesight cold-start concentratord binary..."
+  # $MILESIGHT_LOCAL was fetched and validated in Step 4, before anything on
+  # this gateway was touched. Nothing to re-download here.
+  _SZ=$(wc -c < "$MILESIGHT_LOCAL" 2>/dev/null || echo 0)
 
   $DOCKER_BIN cp "$MILESIGHT_LOCAL" ${CONTAINER_NAME}:/opt/chirpstack/binaries/chirpstack-concentratord-sx1302 \
     || error "docker cp of concentratord binary failed"
@@ -909,7 +903,7 @@ if [ -n "$MILESIGHT_BIN" ]; then
     warn "    size mismatch after cp (host=$_SZ container=$_CSZ)"
   fi
   if $DOCKER_BIN exec ${CONTAINER_NAME} sh -c 'strings /opt/chirpstack/binaries/chirpstack-concentratord-sx1302 2>/dev/null | grep -q milesight_ug65' 2>/dev/null; then
-    info "    ✅ cold-start binary injected and verified (milesight_ug65 supported)"
+    info "    ✅ cold-start binary injected (${_SZ} bytes, milesight_ug65 supported)"
   else
     warn "    could not verify milesight_ug65 support in injected binary"
   fi
