@@ -10,24 +10,43 @@
 'use strict';
 const dgram = require('dgram');
 const crypto = require('crypto');
+const fs = require('fs');
+const http = require('http');
 
-// ── Config ─────────────────────────────────────────────────────────
+// ── Config (JSON file → CLI args → defaults) ───────────────────────
+const CONFIG_PATH = '/opt/chirpstack/mesh_config.json';
 const args = process.argv.slice(2);
 function arg(name, def) {
   const i = args.indexOf('--' + name);
   return i >= 0 && i + 1 < args.length ? args[i + 1] : def;
 }
 
-const ROLE = arg('role', 'relay');
-const SIGNING_KEY = Buffer.from(arg('signing-key', '00112233445566778899aabbccddeeff'), 'hex');
-const LISTEN_PORT = parseInt(arg('listen-port', '1701'));
-const SERVER_HOST = arg('server-host', '127.0.0.1');
-const SERVER_PORT = parseInt(arg('server-port', '1700'));
-const MESH_FREQS = arg('mesh-freqs', '902300000,902500000,902700000').split(',').map(Number);
-const MESH_SF = parseInt(arg('mesh-sf', '7'));
-const MESH_BW = parseInt(arg('mesh-bw', '125000'));
-const TX_POWER = parseInt(arg('tx-power', '27'));
-const MAX_HOP = parseInt(arg('max-hop', '1'));
+// Load persistent config
+let fileCfg = {};
+try { fileCfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch {}
+
+function cfg(name, fallback) {
+  // Priority: CLI arg > file config > fallback
+  const cliVal = arg(name, null);
+  if (cliVal !== null) return cliVal;
+  // Map CLI names to file config keys
+  const fileKey = name.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+  if (fileCfg[name] !== undefined) return String(fileCfg[name]);
+  if (fileCfg[fileKey] !== undefined) return String(fileCfg[fileKey]);
+  return fallback;
+}
+
+const ROLE = cfg('role', 'relay');
+const SIGNING_KEY = Buffer.from(cfg('signing-key', '00112233445566778899aabbccddeeff'), 'hex');
+const LISTEN_PORT = parseInt(cfg('listen-port', '1700'));
+const SERVER_HOST = cfg('server-host', '127.0.0.1');
+const SERVER_PORT = parseInt(cfg('server-port', '1710'));
+const MESH_FREQS = cfg('mesh-freqs', '903900000,904100000,904300000').split(',').map(Number);
+const MESH_SF = parseInt(cfg('mesh-sf', '7'));
+const MESH_BW = parseInt(cfg('mesh-bw', '125000'));
+const TX_POWER = parseInt(cfg('tx-power', '27'));
+const MAX_HOP = parseInt(cfg('max-hop', '1'));
+const CONFIG_PORT = parseInt(cfg('config-port', '8088'));
 
 // ── Semtech UDP ────────────────────────────────────────────────────
 const PROTO = 2;
@@ -373,5 +392,171 @@ class MeshForwarder {
 const fwd = new MeshForwarder();
 fwd.start();
 
+// ── HTTP Config Server (port 8088) ─────────────────────────────────
+const CONFIG_HTML = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LoRa Mesh Config</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:20px}
+h1{color:#00d4ff;margin-bottom:20px;font-size:1.4em}
+.card{background:#16213e;border-radius:8px;padding:20px;margin-bottom:16px;border:1px solid #0f3460}
+.card h2{color:#00d4ff;font-size:1em;margin-bottom:12px}
+.row{display:flex;gap:12px;margin-bottom:10px;flex-wrap:wrap;align-items:center}
+label{min-width:120px;color:#a0a0a0;font-size:0.9em}
+input,select{background:#0f3460;border:1px solid #1a5276;color:#e0e0e0;padding:8px 12px;border-radius:4px;font-size:0.9em;flex:1;min-width:150px}
+input:focus,select:focus{border-color:#00d4ff;outline:none}
+button{background:#00d4ff;color:#1a1a2e;border:none;padding:10px 24px;border-radius:4px;font-weight:bold;cursor:pointer;font-size:0.95em}
+button:hover{background:#00b8d4}
+button.danger{background:#e74c3c;color:white}
+.status{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.on{background:#2ecc71}.off{background:#e74c3c}
+.stats{font-family:monospace;font-size:0.85em;color:#7f8c8d;line-height:1.6}
+.msg{padding:10px;border-radius:4px;margin:10px 0;display:none}
+.msg.ok{background:#1e8449;display:block}.msg.err{background:#922b21;display:block}
+</style></head><body>
+<h1>LoRa Mesh Forwarder</h1>
+<div id="msg" class="msg"></div>
+<div class="card"><h2>Mesh Configuration</h2>
+<form id="cfg">
+<div class="row"><label>Role</label><select name="role"><option value="relay">Relay</option><option value="border">Border</option></select></div>
+<div class="row"><label>Signing Key</label><input name="signing-key" maxlength="32" placeholder="32 hex chars"></div>
+<div class="row"><label>Mesh Freqs (Hz)</label><input name="mesh-freqs" placeholder="comma-separated"></div>
+<div class="row"><label>SF</label><input name="mesh-sf" type="number" min="7" max="12" style="max-width:80px">
+<label>BW (Hz)</label><input name="mesh-bw" type="number" style="max-width:100px"></div>
+<div class="row"><label>TX Power (dBm)</label><input name="tx-power" type="number" min="1" max="30" style="max-width:80px">
+<label>Max Hop</label><input name="max-hop" type="number" min="1" max="5" style="max-width:80px"></div>
+<div class="row"><label>Listen Port</label><input name="listen-port" type="number" style="max-width:80px">
+<label>Bridge Port</label><input name="server-port" type="number" style="max-width:80px"></div>
+<div class="row" style="margin-top:16px"><button type="submit">Save & Restart</button>
+<button type="button" class="danger" onclick="doAction('stop')">Stop</button>
+<button type="button" onclick="doAction('start')">Start</button></div>
+</form></div>
+<div class="card"><h2>Status</h2><div id="stats" class="stats">Loading...</div></div>
+<script>
+function showMsg(text, ok) {
+  const m = document.getElementById('msg');
+  m.textContent = text; m.className = 'msg ' + (ok ? 'ok' : 'err');
+  setTimeout(() => m.className = 'msg', 4000);
+}
+async function loadConfig() {
+  const r = await fetch('/api/config'); const d = await r.json();
+  const f = document.getElementById('cfg');
+  for (const [k,v] of Object.entries(d)) {
+    const el = f.elements[k]; if (el) el.value = v;
+  }
+}
+async function loadStats() {
+  const r = await fetch('/api/stats'); const d = await r.json();
+  document.getElementById('stats').innerHTML =
+    'Role: ' + d.role + '<br>' +
+    'Gateway: ' + (d.gwId || 'learning...') + '<br>' +
+    'Relay ID: ' + (d.relayId || '-') + '<br>' +
+    'RX total: ' + d.rx + ' | Sensor: ' + d.sensor + ' | Mesh in: ' + d.meshIn + '<br>' +
+    'Mesh TX: ' + d.meshTx + ' | Unwrap: ' + d.unwrap + ' | Fwd: ' + d.fwd + '<br>' +
+    'Dedup: ' + d.dedup + ' | Uptime: ' + d.uptime + 's';
+}
+document.getElementById('cfg').addEventListener('submit', async e => {
+  e.preventDefault();
+  const fd = new FormData(e.target); const cfg = {};
+  for (const [k,v] of fd) cfg[k] = v;
+  const r = await fetch('/api/config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
+  const d = await r.json();
+  showMsg(d.ok ? 'Saved! Restarting...' : 'Error: ' + d.error, d.ok);
+});
+async function doAction(act) {
+  const r = await fetch('/api/' + act, {method:'POST'});
+  const d = await r.json();
+  showMsg(d.ok ? act + ' OK' : 'Error: ' + d.error, d.ok);
+}
+loadConfig(); loadStats(); setInterval(loadStats, 5000);
+</script></body></html>`;
+
+function saveConfig(cfg) {
+  try {
+    fs.mkdirSync('/opt/chirpstack', { recursive: true });
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    return true;
+  } catch (e) { return false; }
+}
+
+const startTime = Date.now();
+
+const httpServer = http.createServer((req, res) => {
+  if (req.url === '/' || req.url === '/index.html') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(CONFIG_HTML);
+    return;
+  }
+
+  if (req.url === '/api/config' && req.method === 'GET') {
+    const cfg = {
+      role: ROLE,
+      'signing-key': SIGNING_KEY.toString('hex'),
+      'mesh-freqs': MESH_FREQS.join(','),
+      'mesh-sf': String(MESH_SF),
+      'mesh-bw': String(MESH_BW),
+      'tx-power': String(TX_POWER),
+      'max-hop': String(MAX_HOP),
+      'listen-port': String(LISTEN_PORT),
+      'server-port': String(SERVER_PORT),
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(cfg));
+    return;
+  }
+
+  if (req.url === '/api/stats' && req.method === 'GET') {
+    const s = fwd.stats;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      role: ROLE,
+      gwId: fwd.gwId ? fwd.gwId.toString('hex').toUpperCase() : null,
+      relayId: fwd.relayId ? fwd.relayId.toString('hex') : null,
+      rx: s.rx, sensor: s.sensor, meshIn: s.meshIn,
+      meshTx: s.meshTx, unwrap: s.unwrap, fwd: s.fwd, dedup: s.dedup,
+      uptime: Math.floor((Date.now() - startTime) / 1000),
+    }));
+    return;
+  }
+
+  if (req.url === '/api/config' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const newCfg = JSON.parse(body);
+        if (saveConfig(newCfg)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          // Restart after 1s
+          setTimeout(() => process.exit(0), 1000);
+        } else {
+          throw new Error('write failed');
+        }
+      } catch (e) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  if ((req.url === '/api/stop' || req.url === '/api/start') && req.method === 'POST') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    if (req.url === '/api/stop') setTimeout(() => process.exit(0), 500);
+    return;
+  }
+
+  res.writeHead(404);
+  res.end('Not found');
+});
+
+httpServer.listen(CONFIG_PORT, () => {
+  console.log(`Config UI: http://0.0.0.0:${CONFIG_PORT}`);
+});
+
 process.on('SIGTERM', () => { console.log('SIGTERM, stopping...'); process.exit(0); });
 process.on('SIGINT', () => { console.log('SIGINT, stopping...'); process.exit(0); });
+process.on('exit', () => { httpServer.close(); });
