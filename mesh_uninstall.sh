@@ -18,8 +18,9 @@ if [ -f "$0" ] && [ "$0" != "sh" ] && [ "$0" != "-sh" ]; then
 fi
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-info()  { echo "${GREEN}[INFO]${NC} $1"; }
-warn()  { echo "${YELLOW}[WARN]${NC} $1"; }
+# BusyBox ash's builtin echo does not interpret \033 — printf does, everywhere.
+info()  { printf "${GREEN}[INFO]${NC} %s\n" "$1"; }
+warn()  { printf "${YELLOW}[WARN]${NC} %s\n" "$1"; }
 
 CONTAINER_NAME="chirpstack-mesh"
 
@@ -119,7 +120,7 @@ fi
 HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || echo '<gateway-ip>')
 echo ""
 echo "============================================"
-echo " ${GREEN}LoRa Mesh uninstalled${NC}"
+printf " ${GREEN}LoRa Mesh uninstalled${NC}\n"
 echo "============================================"
 echo " Native pkt_fwd: $([ $RESTARTED -eq 1 ] && echo 'restored' || echo 'not found')"
 echo " Web UI: http://${HOST_IP}"

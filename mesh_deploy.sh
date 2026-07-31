@@ -29,9 +29,10 @@ WORK_DIR="/tmp/mesh-deploy"
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo /tmp)"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-info()  { echo "${GREEN}[INFO]${NC} $1"; }
-warn()  { echo "${YELLOW}[WARN]${NC} $1"; }
-error() { echo "${RED}[ERROR]${NC} $1"; exit 1; }
+# BusyBox ash's builtin echo does not interpret \033 — printf does, everywhere.
+info()  { printf "${GREEN}[INFO]${NC} %s\n" "$1"; }
+warn()  { printf "${YELLOW}[WARN]${NC} %s\n" "$1"; }
+error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; exit 1; }
 
 # BusyBox-safe process check (pgrep -a unsupported; `ps w | grep -c` counts grep itself)
 proc_running() {
@@ -1034,7 +1035,7 @@ HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || hostname 
 if [ "$WAIT_OK" = "true" ]; then
   echo ""
   echo "============================================"
-  echo " ${GREEN}ChirpStack LoRa Mesh deployed!${NC}"
+  printf " ${GREEN}ChirpStack LoRa Mesh deployed!${NC}\n"
   echo "============================================"
   echo " Role:     ${ROLE}"
   echo " Device:   ${GW_MODEL}, Band ${GW_BAND}MHz"
@@ -1049,7 +1050,7 @@ if [ "$WAIT_OK" = "true" ]; then
 else
   echo ""
   echo "============================================"
-  echo " ${RED}Deployment INCOMPLETE — check logs${NC}"
+  printf " ${RED}Deployment INCOMPLETE — check logs${NC}\n"
   echo "============================================"
   echo " Device:  ${GW_MODEL}, Band ${GW_BAND}MHz"
   echo " Logs:    ${DOCKER_BIN} logs --tail 50 ${CONTAINER_NAME}"
