@@ -73,6 +73,16 @@ done
 rm -rf /tmp/mesh-deploy 2>/dev/null
 info "  Temp files cleaned"
 
+# Restore gateway-bridge to port 1700
+BRIDGE_CONF="/etc/lora-gateway-bridge/lora-gateway-bridge.toml"
+if [ -f "$BRIDGE_CONF" ] && grep -q ":1710" "$BRIDGE_CONF"; then
+  sed -i "s|:1710|:1700|g" "$BRIDGE_CONF"
+  killall lora-gateway-bridge 2>/dev/null
+  sleep 1
+  /usr/bin/lora-gateway-bridge -c "$BRIDGE_CONF" > /dev/null 2>&1 &
+  info "  Gateway-bridge restored to port 1700"
+fi
+
 # ── Step 4: Restart native packet forwarder ──
 info "Step 4/4: Restoring native packet forwarder..."
 RESTARTED=0
