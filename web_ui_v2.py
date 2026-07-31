@@ -63,7 +63,10 @@ def _aes_cbc_decrypt(ciphertext_b64):
 
 def _verify_password(username, password):
     """Verify password against gateway's user_permission config."""
-    import crypt
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        import crypt
     valid_user, pw_hash = _load_auth_config()
     if not pw_hash or not valid_user:
         return False
@@ -217,7 +220,12 @@ def _push(line, level="INFO"):
         _buf.append({"ts": ts, "line": line.rstrip(), "level": level, "_seq": _gen})
 
 def _skip(line):
-    return any(s in line for s in SKIP)
+    if any(s in line for s in SKIP):
+        return True
+    # Filter out nginx access logs for log-stream polling (too noisy)
+    if '"GET /api/logs/stream' in line or '"POST /api/login' in line:
+        return True
+    return False
 
 def _tail_mesh_log():
     """Tail /tmp/mesh.log (all supervisord process output)."""
@@ -902,7 +910,7 @@ async function loadSvc() {
   g.innerHTML = "";
   const optionalStopped = ["semtech-udp-forwarder", "mqtt-forwarder"];
   for (const [n,i] of Object.entries(d)) {
-    if (n==="error") continue;
+    if (n==="error") { ok=false; g.innerHTML += "<div class='si'><div class='n'>"+n+"</div><div class='s sERR'>Error</div></div>"; continue; }
     if (i.state !== "RUNNING" && !optionalStopped.includes(n)) ok=false;
     g.innerHTML += "<div class='si'><div class='n'>"+n+"</div><div class='s s"+i.state.slice(0,3)+"'>"+i.state+(i.pid?" ("+i.pid+")":"")+"</div></div>";
   }

@@ -197,7 +197,8 @@ class MeshForwarder {
     // Stats every 60s
     setInterval(() => {
       const s = this.stats;
-      console.log(`Stats: rx=${s.rx} sensor=${s.sensor} mesh_in=${s.meshIn} tx=${s.meshTx} unwrap=${s.unwrap} fwd=${s.fwd} dedup=${s.dedup}`);
+      const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+      console.log(`[${ts}] Stats: rx=${s.rx} sensor=${s.sensor} mesh_in=${s.meshIn} tx=${s.meshTx} unwrap=${s.unwrap} fwd=${s.fwd} dedup=${s.dedup}`);
     }, 60000);
   }
 
@@ -269,6 +270,15 @@ class MeshForwarder {
     // Border: forward sensors to NS
     if (ROLE === 'border' && sensorFrames.length) {
       this.stats.sensor += sensorFrames.length;
+      const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+      for (const { rx, phy } of sensorFrames) {
+        let devAddr = 'unknown';
+        if (phy.length >= 5) {
+          const raw = phy.slice(1, 5).toString('hex');
+          devAddr = raw[6]+raw[7]+raw[4]+raw[5]+raw[2]+raw[3]+raw[0]+raw[1];
+        }
+        console.log(`[${ts}] RX direct dev=${devAddr} freq=${rx.freq}MHz ${rx.datr} rssi=${rx.rssi} snr=${rx.lsnr} ${phy.length}B`);
+      }
       this._forwardSensors(sensorFrames.map(s => s.rx));
     }
 
@@ -287,6 +297,13 @@ class MeshForwarder {
     const freq = rxpk.freq || 0;
     const channel = Math.floor(freq * 10) & 0xFF;
 
+    // Extract DevAddr from PHYPayload (bytes 1-4 of MAC header)
+    let devAddr = 'unknown';
+    if (phy.length >= 5) {
+      devAddr = phy.slice(1, 5).toString('hex');
+      devAddr = devAddr[6]+devAddr[7]+devAddr[4]+devAddr[5]+devAddr[2]+devAddr[3]+devAddr[0]+devAddr[1];
+    }
+
     const meshFrame = buildMeshUplink(
       SIGNING_KEY, this.relayId, phy,
       this.ulCtr, dr,
@@ -297,7 +314,8 @@ class MeshForwarder {
 
     this._txPullResp(meshFrame);
     const txFreq = MESH_FREQS[(this.freqIdx - 1 + MESH_FREQS.length) % MESH_FREQS.length];
-    console.log(`TX mesh: uid=${this.ulCtr} relay=${this.relayId.toString('hex')} freq=${txFreq/1e6}MHz size=${meshFrame.length}B`);
+    const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+    console.log(`[${ts}] TX mesh uid=${this.ulCtr} relay=${this.relayId.toString('hex')} dev=${devAddr} freq=${txFreq/1e6}MHz SF${MESH_SF} ${meshFrame.length}B rssi=${rxpk.rssi} snr=${rxpk.lsnr}`);
   }
 
   _txPullResp(meshFrame) {
@@ -359,7 +377,14 @@ class MeshForwarder {
         size: originalPhy.length,
         data: originalPhy.toString('base64'),
       };
-      console.log(`UNWRAP: relay=${relayId.toString('hex')} uid=${meta.uid} hop=${hopCount} dr=${meta.dr} rssi=${meta.rssi} snr=${meta.snr} size=${originalPhy.length}B`);
+      // Extract DevAddr from original PHYPayload
+      let devAddr = 'unknown';
+      if (originalPhy.length >= 5) {
+        const raw = originalPhy.slice(1, 5).toString('hex');
+        devAddr = raw[6]+raw[7]+raw[4]+raw[5]+raw[2]+raw[3]+raw[0]+raw[1];
+      }
+      const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+      console.log(`[${ts}] UNWRAP relay=${relayId.toString('hex')} uid=${meta.uid} dev=${devAddr} hop=${hopCount} SF${DR_DATR[meta.dr]||'?'} freq=${rxpk.freq}MHz rssi=${meta.rssi} snr=${meta.snr} ${originalPhy.length}B → bridge`);
       this._forwardSensors([newRx]);
       this.stats.fwd++;
     } else if (ROLE === 'relay') {

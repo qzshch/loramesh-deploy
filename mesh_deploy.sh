@@ -119,6 +119,12 @@ _ISZ=$(wc -c < "$IMAGE_TGZ" 2>/dev/null | tr -d ' ')
 [ "$_ISZ" -lt 1000000 ] 2>/dev/null && error "Image too small (${_ISZ} bytes)"
 
 $DOCKER_BIN load -i "$IMAGE_TGZ" 2>/dev/null || error "Image load failed"
+# Tag the loaded image to the expected name (buildx may use different name)
+_LOADED=$($DOCKER_BIN images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep chirpstack-mesh-gw | head -1)
+if [ -n "$_LOADED" ] && [ "$_LOADED" != "${IMAGE_NAME}:latest" ]; then
+  $DOCKER_BIN tag "$_LOADED" "${IMAGE_NAME}:latest" 2>/dev/null
+  info "  Tagged: $_LOADED → ${IMAGE_NAME}:latest"
+fi
 info "  Image ready: $($DOCKER_BIN images --format '{{.Size}}' "$IMAGE_NAME" 2>/dev/null | head -1)"
 
 # ── Step 4: Detect hardware ──
