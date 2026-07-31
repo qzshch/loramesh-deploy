@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ChirpStack LoRa Mesh - Log & Config Web UI (single-gateway view, with auth)"""
 
-import os, re, json, subprocess, threading, time, collections, shutil, hashlib, struct, secrets
+import os, re, json, subprocess, threading, time, collections, hashlib, struct, secrets
 from flask import Flask, request, jsonify, Response, session, redirect
 
 app = Flask(__name__)
@@ -121,10 +121,8 @@ def check_auth():
             return jsonify({"status": -2, "message": "Not authenticated"}), 401
         return redirect("/login")
 
-MESH_CONFIG_PATH = "/opt/chirpstack/mesh_config.toml"
+MESH_CONFIG_PATH = "/opt/chirpstack/mesh_config.json"
 MQTT_CONFIG_PATH = "/opt/chirpstack/mqtt_forwarder.toml"
-CONCENTRATORD_CONFIG_PATH = "/opt/chirpstack/concentratord.toml"
-CONFIGS_DIR = "/opt/chirpstack/configs/chirpstack-concentratord-sx1302"
 IS_BORDER = os.environ.get("RELAY_BORDER", "false") == "true"
 
 DOCKER_BRIDGE_IP = "172.17.0.1"
@@ -188,131 +186,23 @@ def configure_local_ns_forwarder():
     except Exception as e:
         log.warning("Failed to configure local NS forwarder: %s", e)
         return False
-# Also check mesh_config.toml (source of truth) in case env var is stale
+# Also check mesh_config.json (source of truth) in case env var is stale
 try:
-    _mc = open(MESH_CONFIG_PATH).read()
-    _m = re.search(r'border_gateway\s*=\s*(true|false)', _mc)
-    if _m:
-        IS_BORDER = _m.group(1) == "true"
+    _mc = json.loads(open(MESH_CONFIG_PATH).read())
+    if _mc.get("role") == "border":
+        IS_BORDER = True
 except Exception:
     pass
 GW_LABEL = "Border" if IS_BORDER else "Relay"
 
 def is_border():
-    """Dynamic check: reads mesh_config.toml each time (supports runtime role switching)."""
+    """Dynamic check: reads mesh_config.json each time (supports runtime role switching)."""
     try:
-        mc = open(MESH_CONFIG_PATH).read()
-        m = re.search(r'border_gateway\s*=\s*(true|false)', mc)
-        if m:
-            return m.group(1) == "true"
+        mc = json.loads(open(MESH_CONFIG_PATH).read())
+        return mc.get("role") == "border"
     except Exception:
         pass
     return IS_BORDER  # fallback to startup value
-
-# ── Region defaults ──
-
-REGION_DEFAULTS = {
-    # EU868 hardware band (~865-870 MHz)
-    "eu868": {
-        "label": "EU868", "band": "868",
-        "freqs": [868100000, 868300000, 868500000, 867100000, 867300000, 867500000, 867700000, 867900000],
-        "has_lora_std": True, "lora_std_freq": 868300000,
-        "has_fsk": True, "fsk_freq": 868800000,
-    },
-    "in865": {
-        "label": "IN865", "band": "868",
-        "freqs": [865062500, 865402500, 865985000, 0, 0, 0, 0, 0],
-        "has_lora_std": False, "has_fsk": False,
-    },
-    "ru864": {
-        "label": "RU864", "band": "868",
-        "freqs": [868900000, 869100000, 0, 0, 0, 0, 0, 0],
-        "has_lora_std": False, "has_fsk": False,
-    },
-    # US915 hardware band (~902-928 MHz)
-    "us915": {
-        "label": "US915", "band": "915",
-        "freqs": [902300000, 902500000, 902700000, 902900000, 903100000, 903300000, 903500000, 903700000],
-        "has_lora_std": False, "has_fsk": False,
-    },
-    "au915": {
-        "label": "AU915", "band": "915",
-        "freqs": [915200000, 915400000, 915600000, 915800000, 916000000, 916200000, 916400000, 916600000],
-        "has_lora_std": False, "has_fsk": False,
-    },
-    "as923": {
-        "label": "AS923", "band": "915",
-        "freqs": [923200000, 923400000, 923600000, 923800000, 924000000, 924200000, 924400000, 924600000],
-        "has_lora_std": True, "lora_std_freq": 923200000,
-        "has_fsk": False,
-    },
-    "as923_2": {
-        "label": "AS923-2", "band": "915",
-        "freqs": [921400000, 921600000, 921800000, 922000000, 922200000, 922400000, 922600000, 922800000],
-        "has_lora_std": True, "lora_std_freq": 921600000,
-        "has_fsk": False,
-    },
-    "as923_3": {
-        "label": "AS923-3", "band": "915",
-        "freqs": [916600000, 916800000, 917000000, 917200000, 917400000, 917600000, 917800000, 918000000],
-        "has_lora_std": True, "lora_std_freq": 916800000,
-        "has_fsk": False,
-    },
-    "as923_4": {
-        "label": "AS923-4", "band": "915",
-        "freqs": [917300000, 917500000, 917700000, 917900000, 918100000, 918300000, 918500000, 918700000],
-        "has_lora_std": True, "lora_std_freq": 917500000,
-        "has_fsk": False,
-    },
-    "kr920": {
-        "label": "KR920", "band": "915",
-        "freqs": [922100000, 922300000, 922500000, 0, 0, 0, 0, 0],
-        "has_lora_std": False, "has_fsk": False,
-    },
-}
-
-# Hardware band filter — auto-detected via urtool -g on the host
-_URTOOL_BAND_MAP = {"1": "433", "2": "470", "3": "868", "4": "915"}
-
-def _detect_gw_band():
-    """Detect hardware band from urtool -g reserved field (7th char)."""
-    # Check cached value first
-    band_file = "/opt/chirpstack/gw_band.txt"
-    try:
-        return open(band_file).read().strip()
-    except Exception:
-        pass
-    # Run urtool on host via SSH
-    try:
-        # Get host IP (default gateway)
-        import subprocess as sp
-        gw = sp.check_output("ip route | awk '/default/{print $3}'", shell=True).decode().strip()
-        if not gw:
-            return "868"
-        # SSH to host and run urtool
-        pw = os.environ.get("RELAY_PW", "LoRaWAN@2018")
-        out = sp.check_output(
-            ["sshpass", "-p", pw, "ssh", "-o", "StrictHostKeyChecking=no",
-             "-o", "ConnectTimeout=5", f"root@{gw}", "urtool -g"],
-            timeout=10, stderr=sp.DEVNULL).decode()
-        # Parse reserved field
-        for line in out.split("\n"):
-            if line.strip().startswith("reserved") and ":" in line:
-                val = line.split(":", 1)[1].strip()
-                if len(val) >= 7:
-                    band_code = val[6]  # 7th char (1-indexed)
-                    band = _URTOOL_BAND_MAP.get(band_code, "868")
-                    # Cache for next time
-                    try:
-                        open(band_file, "w").write(band)
-                    except Exception:
-                        pass
-                    return band
-    except Exception:
-        pass
-    return "868"
-
-GW_BAND = os.environ.get("GW_BAND", "") or _detect_gw_band()
 
 _buf  = collections.deque(maxlen=2000)
 _lock = threading.Lock()
@@ -368,40 +258,59 @@ def _sv(c, k, val):
     return re.sub(pat, rep, c, count=1, flags=re.MULTILINE)
 
 def read_mesh_cfg():
-    try: c = open(MESH_CONFIG_PATH).read()
-    except FileNotFoundError: return {}
-    raw = _tv(c, "frequencies") or "[]"
+    try:
+        cfg = json.loads(open(MESH_CONFIG_PATH).read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    role = cfg.get("role", "relay")
+    freqs_str = cfg.get("mesh-freqs", "")
+    freqs = [f.strip() for f in freqs_str.split(",") if f.strip()] if freqs_str else []
     return {
-        "logging_level": _tv(c, "level") or "INFO",
-        "signing_key": _tv(c, "signing_key") or "",
-        "border_gateway": _tv(c, "border_gateway") == "true",
-        "heartbeat_interval": _tv(c, "heartbeat_interval") or "5m",
-        "max_hop_count": int(_tv(c, "max_hop_count") or 1),
-        "border_ignore_direct": _tv(c, "border_gateway_ignore_direct_uplinks") == "true",
-        "frequencies": [f.strip() for f in raw.strip("[]").split(",") if f.strip()],
-        "tx_power": int(_tv(c, "tx_power") or 16),
-        "modulation": _tv(c, "modulation") or "LORA",
-        "spreading_factor": int(_tv(c, "spreading_factor") or 7),
-        "bandwidth": int(_tv(c, "bandwidth") or 125000),
-        "code_rate": _tv(c, "code_rate") or "4/5",
+        "logging_level": cfg.get("logging-level", "INFO"),
+        "signing_key": cfg.get("signing-key", ""),
+        "border_gateway": role == "border",
+        "heartbeat_interval": cfg.get("heartbeat-interval", "5m"),
+        "max_hop_count": int(cfg.get("max-hop-count", 1)),
+        "border_ignore_direct": cfg.get("border-ignore-direct", False),
+        "frequencies": freqs,
+        "tx_power": int(cfg.get("tx-power", 16)),
+        "modulation": cfg.get("modulation", "LORA"),
+        "spreading_factor": int(cfg.get("mesh-sf", 7)),
+        "bandwidth": int(cfg.get("mesh-bw", 125000)),
+        "code_rate": cfg.get("code-rate", "4/5"),
     }
 
 def write_mesh_cfg(cfg):
-    try: c = open(MESH_CONFIG_PATH).read()
-    except FileNotFoundError: return False
-    c = _sv(c, "level",            cfg.get("logging_level", "INFO"))
-    c = _sv(c, "signing_key",      cfg.get("signing_key", ""))
-    c = _sv(c, "border_gateway",   cfg.get("border_gateway", False))
-    c = _sv(c, "heartbeat_interval", cfg.get("heartbeat_interval", "5m"))
-    c = _sv(c, "max_hop_count",    int(cfg.get("max_hop_count", 1)))
-    c = _sv(c, "border_gateway_ignore_direct_uplinks", cfg.get("border_ignore_direct", False))
-    c = _sv(c, "frequencies", "[" + ",".join(cfg.get("frequencies", [])) + "]")
-    c = _sv(c, "tx_power",    int(cfg.get("tx_power", 16)))
-    c = _sv(c, "modulation",  cfg.get("modulation", "LORA"))
-    c = _sv(c, "spreading_factor", int(cfg.get("spreading_factor", 7)))
-    c = _sv(c, "bandwidth",   int(cfg.get("bandwidth", 125000)))
-    c = _sv(c, "code_rate",   cfg.get("code_rate", "4/5"))
-    open(MESH_CONFIG_PATH, "w").write(c)
+    try:
+        existing = json.loads(open(MESH_CONFIG_PATH).read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        existing = {}
+    role = "border" if cfg.get("border_gateway", False) else "relay"
+    freqs = cfg.get("frequencies", [])
+    out = {
+        "role": role,
+        "signing-key": cfg.get("signing_key", existing.get("signing-key", "")),
+        "mesh-freqs": ",".join(str(f) for f in freqs),
+        "mesh-sf": str(int(cfg.get("spreading_factor", 7))),
+        "mesh-bw": str(int(cfg.get("bandwidth", 125000))),
+        "tx-power": str(int(cfg.get("tx_power", 16))),
+    }
+    # Preserve optional fields if present in request or existing config
+    for old_key, new_key in [
+        ("logging_level", "logging-level"),
+        ("heartbeat_interval", "heartbeat-interval"),
+        ("max_hop_count", "max-hop-count"),
+        ("border_ignore_direct", "border-ignore-direct"),
+        ("modulation", "modulation"),
+        ("code_rate", "code-rate"),
+    ]:
+        val = cfg.get(old_key)
+        if val is not None:
+            out[new_key] = val if not isinstance(val, (int, float, bool)) else val
+        elif new_key in existing:
+            out[new_key] = existing[new_key]
+    with open(MESH_CONFIG_PATH, "w") as f:
+        json.dump(out, f, indent=2)
     return True
 
 def read_mqtt_cfg():
@@ -431,89 +340,6 @@ def write_mqtt_cfg(cfg):
     c = _sv(c, "json",         cfg.get("mqtt_json", False))
     open(MQTT_CONFIG_PATH, "w").write(c)
     return True
-
-def read_region_cfg():
-    """Read current region from concentratord.toml and channel frequencies."""
-    try:
-        c = open(CONCENTRATORD_CONFIG_PATH).read()
-    except FileNotFoundError:
-        return {"region": "eu868", "freqs": REGION_DEFAULTS["eu868"]["freqs"]}
-    region = (_tv(c, "region") or "EU868").lower()
-    # Read channels — handle multi-line array
-    try:
-        ch = open("/opt/chirpstack/channels.toml").read()
-        # Extract multi_sf_channels block (may span multiple lines)
-        m = re.search(r'multi_sf_channels\s*=\s*\[([^\]]*)\]', ch, re.DOTALL)
-        if m:
-            raw = m.group(1)
-            freqs = [int(f.strip().rstrip(',')) for f in raw.split('\n') if f.strip().rstrip(',').isdigit()]
-        else:
-            freqs = []
-        # Pad to 8
-        while len(freqs) < 8:
-            freqs.append(0)
-    except Exception:
-        freqs = REGION_DEFAULTS.get(region, REGION_DEFAULTS["eu868"])["freqs"]
-    return {"region": region, "freqs": freqs[:8]}
-
-def write_region_cfg(data):
-    """Apply region change: update concentratord.toml, copy region file, generate channels."""
-    region = data.get("region", "eu868").lower()
-    freqs = data.get("freqs", [])
-    if region not in REGION_DEFAULTS:
-        return False, f"Unknown region: {region}"
-
-    # 1. Update concentratord.toml region field
-    try:
-        c = open(CONCENTRATORD_CONFIG_PATH).read()
-        c = _sv(c, "region", region.upper())
-        open(CONCENTRATORD_CONFIG_PATH, "w").write(c)
-    except Exception as e:
-        return False, f"Failed to update concentratord.toml: {e}"
-
-    # 2. Copy region file
-    region_src = os.path.join(CONFIGS_DIR, f"region_{region}.toml")
-    region_dst = "/opt/chirpstack/region.toml"
-    try:
-        if os.path.exists(region_src) and os.path.getsize(region_src) > 0:
-            shutil.copy2(region_src, region_dst)
-        else:
-            # Empty region file (IN865, RU864) — write empty beacon config
-            open(region_dst, "w").write("# No beacon config for this region\n")
-    except Exception as e:
-        return False, f"Failed to copy region file: {e}"
-
-    # 3. Generate channels.toml
-    active_freqs = [f for f in freqs if f > 0]
-    channels_lines = ",\n  ".join(str(f) for f in freqs)
-    channels_toml = f"""[gateway.concentrator]
-multi_sf_channels=[
-  {channels_lines}
-]
-"""
-    # Add lora_std if applicable
-    defaults = REGION_DEFAULTS[region]
-    if defaults.get("has_lora_std"):
-        channels_toml += f"""
-[gateway.concentrator.lora_std]
-frequency={defaults['lora_std_freq']}
-bandwidth=250000
-spreading_factor=7
-"""
-    # Add fsk if applicable
-    if defaults.get("has_fsk"):
-        channels_toml += f"""
-[gateway.concentrator.fsk]
-frequency={defaults['fsk_freq']}
-bandwidth=125000
-datarate=50000
-"""
-    try:
-        open("/opt/chirpstack/channels.toml", "w").write(channels_toml)
-    except Exception as e:
-        return False, f"Failed to write channels.toml: {e}"
-
-    return True, "ok"
 
 def svc_status():
     try:
@@ -650,38 +476,6 @@ body{font-family:"Helvetica Neue",Helvetica,Arial,"PingFang SC","Microsoft YaHei
 
 <!-- CONFIG PANE -->
 <div class="pane" id="pane-config">
-  <!-- Region config -->
-  <div class="card">
-    <div class="ch">Region &amp; Channels</div>
-    <div class="cb">
-      <form onsubmit="saveRegionCfg(event)">
-        <div class="fg"><label>Region</label>
-          <select id="regionSel" onchange="onRegionChange(this.value)">
-            <option value="eu868">EU868</option>
-            <option value="in865">IN865</option>
-            <option value="us915">US915</option>
-            <option value="au915">AU915</option>
-            <option value="as923">AS923</option>
-            <option value="as923_2">AS923-2</option>
-            <option value="as923_3">AS923-3</option>
-            <option value="as923_4">AS923-4</option>
-            <option value="kr920">KR920</option>
-            <option value="ru864">RU864</option>
-          </select>
-          <span class="hint">Changes concentratord frequency band. Restart required.</span>
-        </div>
-        <div class="fg"><label>Channel Frequencies (Hz)</label>
-          <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px" id="chanGrid"></div>
-          <span class="hint" id="chanHint">8 uplink channels. SX1302 auto-tunes 2 radios to cover all channels. Set 0 to disable.</span>
-        </div>
-        <div class="brow">
-          <button type="submit" class="btn btn-p" id="regionSaveBtn">Save &amp; Restart Radio</button>
-          <button type="button" class="btn btn-s" onclick="loadRegionCfg()">Reset</button>
-        </div>
-      </form>
-    </div>
-  </div>
-
   <!-- Mesh config (both roles) -->
   <div class="card">
     <div class="ch">Mesh Configuration</div>
@@ -974,79 +768,7 @@ async function loadMqttCfg() {
   document.getElementById("mqttJson").checked = c.mqtt_json||false;
 }
 
-let regionDefaults = {};
-
-async function loadRegionCfg() {
-  // Load defaults map (once) and populate dropdown
-  if (!Object.keys(regionDefaults).length) {
-    const rr = await fetch("/api/regions");
-    regionDefaults = await rr.json();
-    // Dynamically populate region dropdown
-    const sel = document.getElementById("regionSel");
-    sel.innerHTML = "";
-    for (const [k, v] of Object.entries(regionDefaults)) {
-      const opt = document.createElement("option");
-      opt.value = k;
-      opt.textContent = v.label;
-      sel.appendChild(opt);
-    }
-  }
-  // Load current config
-  const r = await fetch("/api/config/region");
-  const c = await r.json();
-  document.getElementById("regionSel").value = c.region || "eu868";
-  renderChanGrid(c.freqs || (regionDefaults[c.region] || regionDefaults["eu868"]).freqs);
-}
-
-function renderChanGrid(freqs) {
-  const grid = document.getElementById("chanGrid");
-  grid.innerHTML = "";
-  for (let i = 0; i < 8; i++) {
-    const input = document.createElement("input");
-    input.type = "number";
-    input.id = "chan" + i;
-    input.value = freqs[i] || 0;
-    input.style.cssText = "background:#fff;border:1px solid #8a949c;color:#333;padding:4px 6px;border-radius:2px;font-size:12px;height:28px";
-    grid.appendChild(input);
-  }
-}
-
-function onRegionChange(region) {
-  if (regionDefaults[region]) {
-    renderChanGrid(regionDefaults[region].freqs);
-  }
-}
-
-function getChanFreqs() {
-  const freqs = [];
-  for (let i = 0; i < 8; i++) {
-    freqs.push(parseInt(document.getElementById("chan" + i).value) || 0);
-  }
-  return freqs;
-}
-
-async function saveRegionCfg(e) {
-  e.preventDefault();
-  const region = document.getElementById("regionSel").value;
-  const freqs = getChanFreqs();
-  const activeCount = freqs.filter(f => f > 0).length;
-  if (activeCount === 0) {
-    toast("At least one channel frequency must be set", false);
-    return;
-  }
-  setLoading("regionSaveBtn", true);
-  try {
-    const r = await fetch("/api/config/region", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({region, freqs})});
-    const d = await r.json();
-    if (d.ok) toast("Region changed to " + region.toUpperCase() + ", radio restarting...", true);
-    else toast("Error: " + (d.error || "unknown"), false);
-  } catch(e) {
-    toast("Request failed: " + e.message, false);
-  }
-  setLoading("regionSaveBtn", false);
-}
-
-function loadAllCfg() { loadRegionCfg(); loadMeshCfg(); loadMqttCfg(); loadUdpCfg(); }
+function loadAllCfg() { loadMeshCfg(); loadMqttCfg(); loadUdpCfg(); }
 
 function setLoading(btnId, loading) {
   const btn = document.getElementById(btnId);
@@ -1100,7 +822,7 @@ async function saveMeshCfg(e) {
   try {
     const r = await fetch("/api/config/mesh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cfg)});
     const d = await r.json();
-    if (d.ok) toast("Mesh config saved & gateway-mesh restarted", true);
+    if (d.ok) toast("Mesh config saved & mesh-forwarder restarted", true);
     else toast("Error: "+(d.error||"unknown"), false);
   } catch(e) {
     toast("Request failed: "+e.message, false);
@@ -1325,7 +1047,7 @@ def api_set_mesh():
         new_border = data.get("border_gateway", False)
         sc = ["supervisorctl", "-c", "/etc/supervisord.conf"]
         try:
-            subprocess.run(sc + ["restart", "gateway-mesh"], timeout=10)
+            subprocess.run(sc + ["restart", "mesh-forwarder"], timeout=10)
         except Exception:
             pass
         # Auto-manage forwarder services based on role
@@ -1466,33 +1188,6 @@ def _write_udp_cfg(data):
     except Exception:
         return False
 
-@app.route("/api/config/region", methods=["GET"])
-def api_get_region():
-    return jsonify(read_region_cfg())
-
-@app.route("/api/config/region", methods=["POST"])
-def api_set_region():
-    data = request.json or {}
-    ok, msg = write_region_cfg(data)
-    if ok:
-        # Restart concentratord + gateway-mesh to apply new region/channels
-        for svc in ["concentratord", "gateway-mesh"]:
-            try:
-                subprocess.run(["supervisorctl", "-c", "/etc/supervisord.conf", "restart", svc], timeout=15)
-            except Exception:
-                pass
-        return jsonify({"ok": True})
-    return jsonify({"ok": False, "error": msg}), 400
-
-@app.route("/api/regions")
-def api_regions():
-    """Return available regions filtered by gateway hardware band."""
-    result = {}
-    for k, v in REGION_DEFAULTS.items():
-        if v["band"] == GW_BAND or GW_BAND == "all":
-            result[k] = {"label": v["label"], "freqs": v["freqs"], "band": v["band"]}
-    return jsonify(result)
-
 @app.route("/api/status")
 def api_status():
     return jsonify(svc_status())
@@ -1512,7 +1207,7 @@ def api_gateway_info():
 @app.route("/api/restart/<name>", methods=["POST"])
 def api_restart(name):
     if name == "all":
-        procs = ["concentratord", "gateway-mesh"]
+        procs = ["mesh-forwarder"]
         if is_border():
             procs.append("mqtt-forwarder")
         for p in procs:
