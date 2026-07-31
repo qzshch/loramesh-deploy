@@ -1,27 +1,45 @@
 #!/bin/sh
 # ============================================================
 #  ChirpStack LoRa Mesh 一键部署脚本
-#  适用于: Milesight UG56/UG65/UG67/EG71 网关
-#  用法: sh mesh_deploy.sh [--border|--relay]
-#  注意: 如果是从 OSS 下载的，先执行: sed -i 's/\r$//' mesh_deploy.sh
+#  适用于: Milesight UG56/UG63/UG65/UG67/EG71 网关
+#
+#  零操作部署（无需任何前置或后续手工步骤）:
+#    wget -qO- <OSS>/mesh_deploy.sh | sh              # 自动判定角色
+#    wget -qO- <OSS>/mesh_deploy.sh | sh -s -- --border
+#
+#  管道执行天然规避 CRLF 问题；若下载成文件再跑，脚本会自愈行尾。
 # ============================================================
 # Don't use set -e: individual commands have explicit error handling
+
+# ── CRLF self-heal: if this file has CRLF, strip and re-exec ──
+if [ -f "$0" ] && [ "$0" != "sh" ] && [ "$0" != "-sh" ]; then
+  if head -1 "$0" 2>/dev/null | od -c 2>/dev/null | grep -q '\\r'; then
+    sed -i 's/\r$//' "$0" 2>/dev/null && exec sh "$0" "$@"
+  fi
+fi
 
 OSS_BASE="https://ursalink-resource-center.oss-us-west-1.aliyuncs.com/kevin"
 IMAGE_URL="${OSS_BASE}/chirpstack-mesh-gw.tar.gz"
 DOCKER_URL="${OSS_BASE}/docker.tgz"
 COMPOSE_URL="${OSS_BASE}/docker-compose.tgz"
-MILESIGHT_BIN_URL="${OSS_BASE}/chirpstack-concentratord-sx1302-milesight"
-MILESIGHT_NOFD_BIN_URL="${OSS_BASE}/chirpstack-concentratord-sx1302-milesight-nofd"
+MILESIGHT_BIN_URL="${OSS_BASE}/chirpstack-concentratord-sx1302-milesight-coldstart"
 IMAGE_NAME="chirpstack-mesh-gw"
 CONTAINER_NAME="chirpstack-mesh"
 WORK_DIR="/tmp/mesh-deploy"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo /tmp)"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { echo "${GREEN}[INFO]${NC} $1"; }
 warn()  { echo "${YELLOW}[WARN]${NC} $1"; }
 error() { echo "${RED}[ERROR]${NC} $1"; exit 1; }
+
+# BusyBox-safe process check (pgrep -a unsupported; `ps w | grep -c` counts grep itself)
+proc_running() {
+  if command -v pidof >/dev/null 2>&1; then
+    pidof "$1" >/dev/null 2>&1 && return 0
+  fi
+  ps w 2>/dev/null | grep -v grep | grep -q "[ /]$1"
+}
 download() {
   _DL_URL="$1"; _DL_OUT="$2"
   # Offline mode: check for local file in script directory
@@ -45,20 +63,95 @@ download() {
   [ "$_DL_OK" = "true" ] || return 1
 }
 
+# Unexport every GPIO that reset_lgw.sh will export.
+# reset_lgw.sh exports 3 model-specific pins; if ANY one is already exported
+# its export write fails, direction never becomes "out", and the reset pulse
+# silently does nothing ("write error: Device or resource busy").
+gpio_unexport_all() {
+  for GPIO_DIR in /sys/class/gpio/gpio*; do
+    [ -e "$GPIO_DIR" ] || continue
+    GPIO_NAME=$(basename "$GPIO_DIR" 2>/dev/null)
+    case "$GPIO_NAME" in gpiochip*|gpiolib*) continue ;; esac
+    echo "$GPIO_NAME" | grep -q '^gpio' || continue
+    NUM=$(echo "$GPIO_NAME" | sed 's/^gpio//')
+    echo "$NUM" | grep -q '^[0-9][0-9]*$' || continue
+    echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
+  done
+}
+
+# Full SX1302 hardware reset: clean GPIO state → reset pulse → clean again.
+# Verifies the reset actually ran (reset_lgw.sh prints nothing on success but
+# emits "Device or resource busy" on failure).
+sx1302_hw_reset() {
+  gpio_unexport_all
+  if [ -f /usr/sbin/reset_lgw.sh ]; then
+    _RST_OUT=$(/usr/sbin/reset_lgw.sh start 2>&1)
+    if echo "$_RST_OUT" | grep -qi "busy\|error"; then
+      warn "  reset_lgw.sh reported: $(echo "$_RST_OUT" | grep -i 'busy\|error' | head -1)"
+      gpio_unexport_all
+      sleep 1
+      _RST_OUT=$(/usr/sbin/reset_lgw.sh start 2>&1)
+      echo "$_RST_OUT" | grep -qi "busy\|error" && \
+        warn "  SX1302 reset still failing — cold start may not wake SX1250" || \
+        info "  SX1302 hardware reset OK (retry)"
+    else
+      info "  SX1302 hardware reset OK"
+    fi
+  else
+    warn "  /usr/sbin/reset_lgw.sh not found — skipping hardware reset"
+  fi
+  sleep 1
+  gpio_unexport_all
+}
+
+# Stop the native packet forwarder for good.
+# init.d has "respawn retry=10000" → procd restarts it after SIGKILL unless the
+# service registration is deleted via ubus.
+stop_pkt_fwd() {
+  killall -9 lora_pkt_fwd station 2>/dev/null || true
+  ubus call service delete '{"name":"lora_pkt_fwd"}' 2>/dev/null || true
+  /etc/init.d/lora_pkt_fwd disable 2>/dev/null || true
+  sleep 2
+  if proc_running lora_pkt_fwd; then
+    warn "  pkt_fwd still alive after SIGKILL+ubus delete, retrying..."
+    killall -9 lora_pkt_fwd 2>/dev/null || true
+    sleep 2
+  fi
+  proc_running lora_pkt_fwd && warn "  pkt_fwd could not be stopped" || info "  Native pkt_fwd stopped and disabled"
+}
+
 # ── Parse arguments ──
 
-ROLE="relay"
+ROLE=""
 for arg in "$@"; do
   case "$arg" in
     --relay)  ROLE="relay" ;;
     --border) ROLE="border" ;;
   esac
 done
+
+# Auto-select role when not given: a gateway running the built-in Network Server
+# is the natural Border (it has somewhere to deliver unwrapped uplinks).
+if [ -z "$ROLE" ]; then
+  if proc_running loraserver; then
+    ROLE="border"
+    info "Auto-detected role: border (built-in NS running)"
+  else
+    ROLE="relay"
+    info "Auto-detected role: relay (no built-in NS)"
+  fi
+fi
 RELAY_BORDER="false"
 [ "$ROLE" = "border" ] && RELAY_BORDER="true"
 info "Deploying as ${ROLE} gateway"
 
 mkdir -p "$WORK_DIR"
+
+# dockerd loads iptables .so files directly (not via the iptables CLI) and they
+# live outside the default search path. Without this, NAT chains and port
+# publishing (-p) silently break. Must be set before ANY dockerd start attempt,
+# including the "already installed but stopped" path.
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/usr/lib/iptables"
 
 # ── Step 1: Check for existing container ──
 
@@ -75,21 +168,9 @@ fi
 if [ -n "$DOCKER_BIN" ]; then
   EXISTING=$($DOCKER_BIN ps -a --filter "name=${CONTAINER_NAME}" --format "{{.Names}} {{.Status}}" 2>/dev/null || echo "")
   if echo "$EXISTING" | grep -q "$CONTAINER_NAME"; then
-    warn "Existing container found: $EXISTING"
-    if [ -t 0 ]; then
-      printf "  Remove and redeploy? [y/N]: "
-      read confirm
-      if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        $DOCKER_BIN rm -f "$CONTAINER_NAME" 2>/dev/null || true
-        info "Old container removed"
-      else
-        info "Keeping existing container. Exiting."
-        exit 0
-      fi
-    else
-      $DOCKER_BIN rm -f "$CONTAINER_NAME" 2>/dev/null || true
-      info "Old container removed"
-    fi
+    warn "Removing existing container: $EXISTING"
+    $DOCKER_BIN rm -f "$CONTAINER_NAME" 2>/dev/null || true
+    info "Old container removed"
   fi
 else
   info "Docker not found, will install"
@@ -98,6 +179,40 @@ fi
 # ── Step 2: Install Docker if needed ──
 
 info "Step 2/9: Checking Docker..."
+
+# Fast path: binaries already extracted but daemon is down — just start it.
+# Avoids re-downloading 48 MB on a gateway that merely rebooted.
+if [ -z "$DOCKER_BIN" ] || ! $DOCKER_BIN info >/dev/null 2>&1; then
+  if [ -x /overlay/docker/bin/dockerd ] || [ -x /usr/bin/docker/dockerd ]; then
+    info "  Docker installed but daemon not running — starting..."
+    /etc/init.d/docker start 2>/dev/null
+    sleep 8
+    for path in /usr/bin/docker/docker /overlay/docker/bin/docker; do
+      if [ -x "$path" ] && "$path" info >/dev/null 2>&1; then DOCKER_BIN="$path"; break; fi
+    done
+    # init.d may not export LD_LIBRARY_PATH — start dockerd directly if it failed
+    if [ -z "$DOCKER_BIN" ]; then
+      warn "  init.d start failed, launching dockerd directly (with iptables libs)..."
+      killall dockerd containerd 2>/dev/null; sleep 2
+      _DOCKERD=/overlay/docker/bin/dockerd
+      [ -x "$_DOCKERD" ] || _DOCKERD=/usr/bin/docker/dockerd
+      "$_DOCKERD" --config-file /etc/docker/daemon.json >/tmp/dockerd.log 2>&1 &
+      sleep 10
+      for path in /usr/bin/docker/docker /overlay/docker/bin/docker; do
+        if [ -x "$path" ] && "$path" info >/dev/null 2>&1; then DOCKER_BIN="$path"; break; fi
+      done
+    fi
+    [ -n "$DOCKER_BIN" ] && info "  Docker daemon started: $DOCKER_BIN"
+    # Existing container may now be visible — remove it
+    if [ -n "$DOCKER_BIN" ]; then
+      $DOCKER_BIN ps -a --format "{{.Names}}" 2>/dev/null | grep -q "^${CONTAINER_NAME}$" && {
+        warn "  Removing existing container found after daemon start"
+        $DOCKER_BIN rm -f "$CONTAINER_NAME" 2>/dev/null || true
+      }
+    fi
+  fi
+fi
+
 if [ -z "$DOCKER_BIN" ] || ! $DOCKER_BIN info >/dev/null 2>&1; then
   info "Docker not running or not installed. Installing..."
 
@@ -380,75 +495,33 @@ esac
 SX1302_RESET_GPIO=31
 info "Product=$PRODUCT, Band=${GW_BAND}MHz, concentratord reset=pin${SX1302_RESET_GPIO} (harmless)"
 
-# Hot-switch detection: some hwver can't init SX1302 from scratch via concentratord
-# (SPI returns chip version 0x00). Native pkt_fwd has Milesight board-specific init
-# that leaves hardware in a working state. For these, we kill pkt_fwd WITHOUT GPIO
-# reset and immediately start the container to inherit the initialized SPI bus.
+# ── Cold start on every hardware version (M33) ──
 #
-# Binary selection: based on native HAL's PA detection result (/tmp/newpa vs /tmp/oldpa)
-# rather than hwver alone, because the same hwver may have different BOM/PA circuits.
-# The native pkt_fwd reads SX1302 GPIO 0x117 and creates /tmp/newpa or /tmp/oldpa
-# during startup. We use this as the ground truth for PA configuration.
-NEEDS_HOT_SWITCH=false
-MILESIGHT_BIN=""
-case "$HWVER" in
-  0130|0150|0200) NEEDS_HOT_SWITCH=true ;;
-esac
-
-# ── Ensure PA marker files exist (race condition guard) ──
-# /tmp is tmpfs — wiped on reboot. Native pkt_fwd creates /tmp/newpa or /tmp/oldpa
-# during SX1302 init (reads GPIO 0x117). If gateway just rebooted, pkt_fwd may not
-# have finished init yet. Wait up to 30s for markers to appear.
-if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
-  if [ ! -f /tmp/newpa ] && [ ! -f /tmp/oldpa ]; then
-    info "  Waiting for native pkt_fwd PA detection (marker files)..."
-    # Ensure pkt_fwd is actually running
-    if ! pgrep -x lora_pkt_fwd >/dev/null 2>&1; then
-      warn "    pkt_fwd not running, starting it..."
-      /etc/init.d/lora_pkt_fwd start >/dev/null 2>&1 || true
-    fi
-    _PA_WAIT=0
-    while [ $_PA_WAIT -lt 30 ]; do
-      if [ -f /tmp/newpa ] || [ -f /tmp/oldpa ]; then
-        info "    PA marker appeared after ${_PA_WAIT}s"
-        break
-      fi
-      sleep 2
-      _PA_WAIT=$((_PA_WAIT + 2))
-      # Re-check pkt_fwd is alive (it may have crashed)
-      if ! pgrep -x lora_pkt_fwd >/dev/null 2>&1; then
-        warn "    pkt_fwd died during init, restarting..."
-        /etc/init.d/lora_pkt_fwd start >/dev/null 2>&1 || true
-      fi
-    done
-    if [ ! -f /tmp/newpa ] && [ ! -f /tmp/oldpa ]; then
-      warn "    Timeout: no PA marker after 30s, will use hwver fallback"
-    fi
-  fi
-fi
-
-if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
-  warn "  hwver=$HWVER: hot-switch mode (skip GPIO reset, inherit pkt_fwd hardware init)"
-
-  # Determine binary based on native HAL's PA detection result
-  if [ -f /tmp/newpa ]; then
-    MILESIGHT_BIN="$MILESIGHT_BIN_URL"
-    info "  PA detect: /tmp/newpa found → full_duplex=true binary (AD5338R DAC present)"
-  elif [ -f /tmp/oldpa ]; then
-    MILESIGHT_BIN="$MILESIGHT_NOFD_BIN_URL"
-    info "  PA detect: /tmp/oldpa found → full_duplex=false binary (no DAC, avoid TX hang)"
-  else
-    # Fallback: no marker files, use hwver as hint
-    warn "  PA detect: no marker files, falling back to hwver-based selection"
-    case "$HWVER" in
-      0200) MILESIGHT_BIN="$MILESIGHT_NOFD_BIN_URL"; warn "    hwver=0200 → nofd (safe default)" ;;
-      *)    MILESIGHT_BIN="$MILESIGHT_BIN_URL"; warn "    hwver=$HWVER → original" ;;
-    esac
-  fi
-fi
-if [ -n "$MILESIGHT_BIN" ]; then
-  info "  Milesight custom concentratord binary will be injected"
-fi
+# History: hwver 0130/0150/0200 used to need "hot-switch" — let native pkt_fwd
+# initialize SX1302/SX1250, kill -9 it, then have concentratord inherit the
+# hardware state. That was a workaround for two real bugs, both now fixed:
+#
+#   1. sx1302_radio_reset() was skipped in milesight_mode, so SX1250 stayed in
+#      SLEEP (status 0x00) and STANDBY_RC failed.        → restored (M32)
+#   2. sx1302_agc_start() read back AGC mailbox 2 (FDD) unconditionally while
+#      only writing it for sx125x radios. On SX1250 it compared fdd_mode
+#      against a stale value → "FDD mode of Radio A has not been set properly"
+#      → AGC firmware never started. Surfaced as a phantom "Radio B hang" when
+#      the stale value happened to match.                → fixed (M33)
+#
+# With both fixed, the cold-start binary initializes every hwver from scratch:
+#   sx1302_radio_reset() wakes SX1250 (0x22) → ms_sx1250_setup() → STANDBY_XOSC
+#   (0x32) → AGC Radio A + Radio B + gain stages 0x04-0x0F → RX/TX working.
+#
+# Requirement: a real SX1302 hardware reset (reset_lgw.sh) must happen while no
+# other process holds the SPI bus — handled in Step 5/6.
+#
+# The binary auto-detects PA type (NEWPA/OLDPA) and duplex mode via the Semtech
+# register API, so one binary covers every board revision including unknown
+# future hwver (e.g. UG67 0320).
+MILESIGHT_BIN="$MILESIGHT_BIN_URL"
+MODEL="milesight_ug65"
+info "  Cold-start binary (auto PA/duplex detect) — hwver=${HWVER:-unknown}"
 
 # UG56: download prerequisite files if missing
 if [ "$PRODUCT" = "56" ]; then
@@ -466,71 +539,24 @@ if [ "$PRODUCT" = "56" ]; then
   fi
 fi
 
-# ── Step 5: Stop packet forwarder only (it's the only SPI holder) ──
+# ── Step 5: Stop packet forwarder (it holds SPI + GPIO) ──
 
 info "Step 5/9: Stopping native packet forwarder (SPI holder)..."
-if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
-  # Hot-switch: kill pkt_fwd with SIGKILL to preserve SX1250 hardware state.
-  # SIGTERM (init.d stop) triggers pkt_fwd clean shutdown which resets SX1250
-  # to STANDBY_RC, causing concentratord init to fail.
-  #
-  # init.d has "procd_set_param respawn retry=10000" — procd WILL restart
-  # pkt_fwd after SIGKILL. Use ubus to delete the procd service registration
-  # (does NOT trigger stop_service callback, so GPIO stays untouched).
-  killall -9 lora_pkt_fwd station 2>/dev/null || true
-  ubus call service delete '{"name":"lora_pkt_fwd"}' 2>/dev/null || true
-  /etc/init.d/lora_pkt_fwd disable 2>/dev/null || true
-  info "  Hot-switch: pkt_fwd killed (SIGKILL + procd deregistered)"
-else
-  # Non-hot-switch: init.d stop is safe (no STANDBY_RC issue on these hwver)
-  if [ -f "/etc/init.d/lora_pkt_fwd" ]; then
-    /etc/init.d/lora_pkt_fwd stop 2>/dev/null && info "  Stopped lora_pkt_fwd" || true
-    /etc/init.d/lora_pkt_fwd disable 2>/dev/null && info "  Disabled lora_pkt_fwd auto-start" || true
-  fi
-fi
+stop_pkt_fwd
 # Keep NS services running: loraserver, lora_app_server, lora_gateway_bridge, postgres
-sleep 2
 
-# ── Step 6: Initialize GPIO ──
+# ── Step 6: SX1302 hardware reset ──
+# Required for cold start: reset_lgw.sh pulses the real reset pin via sysfs and
+# leaves it as input (high-Z ≈ HIGH = not held in reset). Only after this can
+# concentratord's sx1302_radio_reset() wake SX1250 out of SLEEP.
 
-info "Step 6/9: Initializing SX1302 GPIO..."
-if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
-  info "  Hot-switch: skipping GPIO init (preserving hardware state)"
-else
-# Unexport GPIOs BEFORE reset_lgw.sh (it re-exports them for reset)
-for GPIO_DIR in /sys/class/gpio/gpio*; do
-  GPIO_NAME=$(basename "$GPIO_DIR" 2>/dev/null)
-  case "$GPIO_NAME" in gpiochip*|gpiolib*) continue ;; esac
-  echo "$GPIO_NAME" | grep -q '^gpio' || continue
-  NUM=$(echo "$GPIO_NAME" | sed 's/^gpio//')
-  echo "$NUM" | grep -q '^[0-9][0-9]*$' || continue
-  echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
-done
-
-# Run reset script (exports, toggles, may or may not unexport)
-if [ -f /usr/sbin/reset_lgw.sh ]; then
-  /usr/sbin/reset_lgw.sh start 2>/dev/null && info "  reset_lgw.sh done" || warn "  reset_lgw.sh skipped"
-fi
-
-# Wait for kernel to release GPIO resources after reset
-sleep 1
-
-# Unexport AGAIN after reset (reset_lgw.sh leaves GPIOs exported)
-for GPIO_DIR in /sys/class/gpio/gpio*; do
-  GPIO_NAME=$(basename "$GPIO_DIR" 2>/dev/null)
-  case "$GPIO_NAME" in gpiochip*|gpiolib*) continue ;; esac
-  echo "$GPIO_NAME" | grep -q '^gpio' || continue
-  NUM=$(echo "$GPIO_NAME" | sed 's/^gpio//')
-  echo "$NUM" | grep -q '^[0-9][0-9]*$' || continue
-  echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
-done
-info "  GPIO cleanup done"
-fi  # end hot-switch skip
+info "Step 6/9: SX1302 hardware reset..."
+sx1302_hw_reset
 
 # ── Start built-in NS services BEFORE container (so web_ui can detect LGB) ──
 # If loraserver is running on host, start LGB + lora_app_server now.
 # Container's web_ui will detect LGB on startup and auto-configure the forwarder.
-if pidof loraserver >/dev/null 2>&1; then
+if proc_running loraserver; then
   info "  Built-in NS detected — starting host services before container..."
 
   if command -v mosquitto_passwd >/dev/null 2>&1; then
@@ -538,12 +564,17 @@ if pidof loraserver >/dev/null 2>&1; then
       info "    loraappserver MQTT user synced" || true
   fi
 
-  if [ -f /etc/init.d/lora_gateway_bridge ] && ! pidof lora-gateway-bridge >/dev/null 2>&1; then
-    /etc/init.d/lora_gateway_bridge start 2>/dev/null && info "    LGB started" || true
+  # LGB only bridges UDP→MQTT when /tmp/pkt_fwd_type says so, otherwise its
+  # init.d script exits without starting.
+  if [ -f /etc/init.d/lora_gateway_bridge ]; then
+    echo "lora_gateway_bridge 1" > /tmp/pkt_fwd_type 2>/dev/null || true
+    if ! proc_running lora-gateway-bridge; then
+      /etc/init.d/lora_gateway_bridge start 2>/dev/null && info "    LGB started" || true
+    fi
     /etc/init.d/lora_gateway_bridge enable 2>/dev/null || true
   fi
 
-  if [ -f /etc/init.d/lora_app_server ] && ! pidof lora-app-server >/dev/null 2>&1; then
+  if [ -f /etc/init.d/lora_app_server ] && ! proc_running lora-app-server; then
     /etc/init.d/lora_app_server start 2>/dev/null && info "    lora_app_server started" || true
     /etc/init.d/lora_app_server enable 2>/dev/null || true
   fi
@@ -613,18 +644,26 @@ else
 fi
 info "  Gateway EUI: $GATEWAY_EUI"
 
-# Region-dependent defaults
+# Region-dependent defaults.
+#
+# MESH_TX_POWER: on US915/AU915 Milesight boards an external PA sits in the TX
+# path, gated by pa_gain in the TX gain LUT: pa_gain=0 for <=17 dBm, pa_gain=1
+# for >=18 dBm. At 16 dBm the signal passes through an UNPOWERED PA and is
+# attenuated into the noise floor (measured: -146 dBm at the peer). Use 27 dBm
+# so pa_gain=1 powers the PA. EU868 has no external PA — 16 dBm is correct and
+# also keeps duty-cycle headroom.
 case "$TMP_REGION" in
-  eu868)  DEFAULT_FREQS="868100000,868300000,868500000"; CHANNELS_CFG="eu868" ;;
-  us915)  DEFAULT_FREQS="902300000,902500000,902700000"; CHANNELS_CFG="us915_0" ;;
-  in865)  DEFAULT_FREQS="865062500,865402500,865985000"; CHANNELS_CFG="in865" ;;
-  au915)  DEFAULT_FREQS="915200000,915400000,915600000"; CHANNELS_CFG="au915_0" ;;
-  as923)  DEFAULT_FREQS="923200000,923400000,923600000"; CHANNELS_CFG="as923" ;;
-  kr920)  DEFAULT_FREQS="922100000,922300000,922500000"; CHANNELS_CFG="kr920" ;;
-  ru864)  DEFAULT_FREQS="868900000,869100000"; CHANNELS_CFG="ru864" ;;
-  eu433)  DEFAULT_FREQS="433175000,433375000,433575000"; CHANNELS_CFG="eu433" ;;
-  *)      DEFAULT_FREQS="868100000,868300000,868500000"; CHANNELS_CFG="eu868" ;;
+  eu868)  DEFAULT_FREQS="868100000,868300000,868500000"; CHANNELS_CFG="eu868"; MESH_TX_POWER=16 ;;
+  us915)  DEFAULT_FREQS="902300000,902500000,902700000"; CHANNELS_CFG="us915_0"; MESH_TX_POWER=27 ;;
+  in865)  DEFAULT_FREQS="865062500,865402500,865985000"; CHANNELS_CFG="in865"; MESH_TX_POWER=16 ;;
+  au915)  DEFAULT_FREQS="915200000,915400000,915600000"; CHANNELS_CFG="au915_0"; MESH_TX_POWER=27 ;;
+  as923)  DEFAULT_FREQS="923200000,923400000,923600000"; CHANNELS_CFG="as923"; MESH_TX_POWER=16 ;;
+  kr920)  DEFAULT_FREQS="922100000,922300000,922500000"; CHANNELS_CFG="kr920"; MESH_TX_POWER=16 ;;
+  ru864)  DEFAULT_FREQS="868900000,869100000"; CHANNELS_CFG="ru864"; MESH_TX_POWER=16 ;;
+  eu433)  DEFAULT_FREQS="433175000,433375000,433575000"; CHANNELS_CFG="eu433"; MESH_TX_POWER=16 ;;
+  *)      DEFAULT_FREQS="868100000,868300000,868500000"; CHANNELS_CFG="eu868"; MESH_TX_POWER=16 ;;
 esac
+info "  Mesh TX power: ${MESH_TX_POWER} dBm$([ "$MESH_TX_POWER" -ge 18 ] && echo ' (external PA enabled)')"
 
 # UG56 special handling: no gpiochip device, needs --privileged + sysfs GPIO
 UG56_OPTS=""
@@ -658,7 +697,7 @@ DOCKER_OPTS="-d --name $CONTAINER_NAME --restart unless-stopped \
   -e RELAY_SIGNING_KEY=00112233445566778899aabbccddeeff \
   -e RELAY_FREQUENCIES=${DEFAULT_FREQS} \
   -e RELAY_SF=7 \
-  -e RELAY_TX_POWER=16 \
+  -e RELAY_TX_POWER=${MESH_TX_POWER} \
   -e MQTT_SERVER=tcp://192.168.45.38:1884 \
   -e MQTT_TOPIC_PREFIX=${TMP_REGION} \
   -e MQTT_BACKEND_SOCKET=forwarder \
@@ -666,26 +705,12 @@ DOCKER_OPTS="-d --name $CONTAINER_NAME --restart unless-stopped \
   -e GW_BAND=${GW_BAND} \
   -e DEBUG=INFO"
 
-# Final GPIO cleanup before main container launch
-if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
-  info "  Hot-switch: skipping pre-launch GPIO cleanup and SX1250 wait"
-else
+# Pre-launch: GPIO must be clean so concentratord's cdev reset (harmless pin 31)
+# can claim it, and SX1250 needs a moment to settle after the hardware reset.
 info "  Pre-launch GPIO cleanup..."
-for GPIO_DIR in /sys/class/gpio/gpio*; do
-  GPIO_NAME=$(basename "$GPIO_DIR" 2>/dev/null)
-  case "$GPIO_NAME" in gpiochip*|gpiolib*) continue ;; esac
-  echo "$GPIO_NAME" | grep -q '^gpio' || continue
-  NUM=$(echo "$GPIO_NAME" | sed 's/^gpio//')
-  echo "$NUM" | grep -q '^[0-9][0-9]*$' || continue
-  echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
-done
-
-# CRITICAL: Wait for SX1250 radios to stabilize after GPIO reset.
-# Without this delay, concentratord's SPI init fails with STANDBY_RC error
-# on some hardware versions (especially after warm restarts).
-info "  Waiting 10s for SX1250 stabilization..."
-sleep 10
-fi  # end hot-switch skip for pre-launch
+gpio_unexport_all
+info "  Waiting 5s for SX1250 stabilization..."
+sleep 5
 
 $DOCKER_BIN run $DOCKER_OPTS ${IMAGE_NAME}
 sleep 3
@@ -712,11 +737,27 @@ fi
 
 # Fix mesh frequencies to match region (image default is EU868)
 info "  Setting mesh frequencies for $TMP_REGION..."
-$DOCKER_BIN exec ${CONTAINER_NAME} sed -i \
-  "s/frequencies=\[868100000,868300000,868500000\]/frequencies=[$DEFAULT_FREQS]/" \
-  /opt/chirpstack/mesh_config.toml 2>/dev/null && \
-  info "    mesh frequencies updated: $DEFAULT_FREQS" || \
-  warn "    mesh frequency update skipped (non-default config?)"
+# Rewrite mesh frequencies + TX power regardless of what the image shipped with.
+# Anchored on the key name, not the EU868 default value, so re-deploys and any
+# image default both converge to the right region settings.
+$DOCKER_BIN exec ${CONTAINER_NAME} sh -c \
+  "sed -i 's|^\( *\)frequencies=.*|\1frequencies=[$DEFAULT_FREQS]|; s|^\( *\)tx_power=.*|\1tx_power=$MESH_TX_POWER|' /opt/chirpstack/mesh_config.toml" 2>/dev/null
+MESH_CHECK=$($DOCKER_BIN exec ${CONTAINER_NAME} sh -c "grep -E '^ *(frequencies|tx_power)=' /opt/chirpstack/mesh_config.toml | tr -d ' \n'" 2>/dev/null)
+if echo "$MESH_CHECK" | grep -q "tx_power=$MESH_TX_POWER"; then
+  info "    mesh config: freq=$DEFAULT_FREQS tx_power=${MESH_TX_POWER}dBm"
+else
+  warn "    mesh config update could not be verified: $MESH_CHECK"
+fi
+
+# Inject SSL certificates via docker cp (volume mount -v is unreliable on some firmware)
+if [ -f /etc/https.crt ] && [ -f /etc/https.key ]; then
+  $DOCKER_BIN cp /etc/https.crt ${CONTAINER_NAME}:/etc/ssl_cert 2>/dev/null && \
+    $DOCKER_BIN cp /etc/https.key ${CONTAINER_NAME}:/etc/ssl_key 2>/dev/null && \
+    info "  SSL certificates injected via docker cp" || \
+    warn "  SSL cert injection failed"
+else
+  warn "  No SSL certs found on host (/etc/https.crt, /etc/https.key) — nginx HTTPS will fail"
+fi
 
 # Inject nginx config (image default uses /etc/ssl_cert which doesn't exist)
 info "  Injecting nginx config..."
@@ -750,16 +791,10 @@ NGXEOF
 rm -f /etc/nginx/http.d/default.conf /etc/nginx/conf.d/default.conf
 ' 2>/dev/null && info "    nginx config injected" || warn "    nginx config injection failed"
 
-# Inject Milesight custom concentratord binary (PA-based selection)
-# /tmp/newpa → full_duplex=true (AD5338R DAC present, needed for SX1250 init)
-# /tmp/oldpa → full_duplex=false (no DAC, full_duplex=true causes TX hang)
+# Inject Milesight cold-start concentratord binary (auto board detect)
 if [ -n "$MILESIGHT_BIN" ]; then
-  info "  Injecting Milesight concentratord binary..."
-  if [ "$MILESIGHT_BIN" = "$MILESIGHT_NOFD_BIN_URL" ]; then
-    MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight-nofd"
-  else
-    MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight"
-  fi
+  info "  Injecting Milesight cold-start concentratord binary..."
+  MILESIGHT_LOCAL="/etc/chirpstack-concentratord-sx1302-milesight-coldstart"
   if [ ! -f "$MILESIGHT_LOCAL" ]; then
     download "$MILESIGHT_BIN" "$MILESIGHT_LOCAL" && \
       chmod +x "$MILESIGHT_LOCAL" && info "    downloaded to $MILESIGHT_LOCAL" || \
@@ -768,7 +803,7 @@ if [ -n "$MILESIGHT_BIN" ]; then
   if [ -f "$MILESIGHT_LOCAL" ]; then
     $DOCKER_BIN cp "$MILESIGHT_LOCAL" ${CONTAINER_NAME}:/opt/chirpstack/binaries/chirpstack-concentratord-sx1302 && \
       $DOCKER_BIN exec ${CONTAINER_NAME} chmod +x /opt/chirpstack/binaries/chirpstack-concentratord-sx1302 && \
-      info "    Milesight binary injected" || warn "    injection failed"
+      info "    Milesight cold-start binary injected" || warn "    injection failed"
   fi
   # Remove sx1302_reset_pin from concentratord.toml (hot-switch handles reset externally)
   $DOCKER_BIN exec ${CONTAINER_NAME} sed -i '/sx1302_reset/d' /opt/chirpstack/concentratord.toml 2>/dev/null && \
@@ -890,35 +925,15 @@ $DOCKER_BIN exec ${CONTAINER_NAME} ln -sf /tmp/mesh.log /tmp/gateway-mesh.log 2>
 # This is critical: entrypoint re-copies source templates (now with band data)
 # to runtime files, and supervisord picks up all config changes from a clean state
 info "Step 9/9: Restarting container to apply all changes..."
-# Stop container first (docker restart doesn't allow GPIO reset between stop/start)
+# Stop container first (docker restart doesn't allow a hardware reset in between)
 $DOCKER_BIN stop ${CONTAINER_NAME} >/dev/null 2>&1
 
-if [ "$NEEDS_HOT_SWITCH" = "true" ]; then
-  info "  Hot-switch: skipping GPIO reset (preserving SPI bus state)"
-else
-# GPIO reset between stop and start — critical for SX1250 stability
-for GPIO_DIR in /sys/class/gpio/gpio*; do
-  GPIO_NAME=$(basename "$GPIO_DIR" 2>/dev/null)
-  case "$GPIO_NAME" in gpiochip*|gpiolib*) continue ;; esac
-  echo "$GPIO_NAME" | grep -q '^gpio' || continue
-  NUM=$(echo "$GPIO_NAME" | sed 's/^gpio//')
-  echo "$NUM" | grep -q '^[0-9][0-9]*$' || continue
-  echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
-done
-/usr/sbin/reset_lgw.sh start >/dev/null 2>&1 || true
-sleep 1
-for GPIO_DIR in /sys/class/gpio/gpio*; do
-  GPIO_NAME=$(basename "$GPIO_DIR" 2>/dev/null)
-  case "$GPIO_NAME" in gpiochip*|gpiolib*) continue ;; esac
-  echo "$GPIO_NAME" | grep -q '^gpio' || continue
-  NUM=$(echo "$GPIO_NAME" | sed 's/^gpio//')
-  echo "$NUM" | grep -q '^[0-9][0-9]*$' || continue
-  echo "$NUM" > /sys/class/gpio/unexport 2>/dev/null || true
-done
-fi  # end hot-switch skip for Step 9
+# Hardware reset between stop and start — SX1250 must be reset from a state where
+# nothing holds the SPI bus, otherwise it stays in SLEEP and STANDBY_RC fails.
+sx1302_hw_reset
 
-info "  Waiting 10s for SX1250 stabilization..."
-sleep 10
+info "  Waiting 5s for SX1250 stabilization..."
+sleep 5
 
 $DOCKER_BIN start ${CONTAINER_NAME} >/dev/null 2>&1
 info "  Waiting for services to initialize (polling up to 90s)..."
@@ -952,51 +967,64 @@ for PROC in concentratord gateway-mesh nginx web-ui; do
   fi
 done
 
-# ── STANDBY_RC fallback: remove reset pin + hot-switch ──
-# Some hwver=0130 devices fail STANDBY_RC even with hot-switch because
-# concentratord's internal GPIO reset (pin 31) puts SX1250 in bad state.
-# Fix: remove sx1302_reset_pin from config + fresh hot-switch.
+# ── Cold-start retry: SX1250 stuck in SLEEP ──
+# If concentratord failed with SX1250 status 0x00, the SX1302 hardware reset did
+# not take effect (usually a leftover exported GPIO made reset_lgw.sh fail, or
+# pkt_fwd was respawned by procd and grabbed the SPI bus again). Retry the whole
+# cold-start sequence once, from a clean state.
 CONC_STATUS=$($DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl status concentratord 2>/dev/null | awk '{print $2}')
-if [ "$CONC_STATUS" = "FATAL" ]; then
-  CONC_LOG=$($DOCKER_BIN exec ${CONTAINER_NAME} cat /tmp/mesh.log 2>/dev/null | tail -20)
-  if echo "$CONC_LOG" | grep -qi "STANDBY_RC\|lgw_start failed"; then
-    warn "  ⚠️ concentratord FATAL (STANDBY_RC detected). Applying fallback..."
-    info "    Removing sx1302_reset_pin from concentratord.toml..."
-    $DOCKER_BIN exec ${CONTAINER_NAME} sed -i '/sx1302_reset/d' /opt/chirpstack/concentratord.toml 2>/dev/null
-    info "    Fresh hot-switch: starting pkt_fwd to re-init hardware..."
-    /etc/init.d/lora_pkt_fwd start >/dev/null 2>&1
-    _HS_WAIT=0
-    while [ $_HS_WAIT -lt 20 ]; do
-      sleep 3; _HS_WAIT=$((_HS_WAIT + 3))
-      if tail -5 /etc/urlog/lora-pkt-fwd.log 2>/dev/null | grep -q "JSON up"; then
-        info "    Hardware re-initialized after ${_HS_WAIT}s"
-        break
-      fi
-    done
-    killall -9 lora_pkt_fwd 2>/dev/null || true
-    ubus call service delete '{"name":"lora_pkt_fwd"}' 2>/dev/null || true
-    sleep 1
-    info "    Restarting concentratord (no reset pin, hot-switch inherited)..."
-    $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl start concentratord 2>/dev/null
-    sleep 10
-    CONC_STATUS2=$($DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl status concentratord 2>/dev/null | awk '{print $2}')
-    if [ "$CONC_STATUS2" = "RUNNING" ]; then
-      info "    ✅ concentratord running after STANDBY_RC fallback"
-      # Also restart gateway-mesh since it depends on concentratord
-      $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl restart gateway-mesh 2>/dev/null
-      WAIT_OK=true
-    else
-      warn "    ❌ concentratord still not running after fallback"
-    fi
+CONC_LOG=$($DOCKER_BIN exec ${CONTAINER_NAME} cat /tmp/mesh.log 2>/dev/null | tail -40)
+if [ "$CONC_STATUS" = "FATAL" ] || echo "$CONC_LOG" | grep -qi "failed STANDBY_RC\|lgw_start failed"; then
+  warn "  ⚠️ SX1250 did not wake (status 0x00) — retrying cold start..."
+  $DOCKER_BIN stop ${CONTAINER_NAME} >/dev/null 2>&1
+  stop_pkt_fwd
+  sx1302_hw_reset
+  sleep 5
+  $DOCKER_BIN start ${CONTAINER_NAME} >/dev/null 2>&1
+  info "    Waiting 30s for concentratord..."
+  sleep 30
+  CONC_STATUS2=$($DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl status concentratord 2>/dev/null | awk '{print $2}')
+  CONC_LOG2=$($DOCKER_BIN exec ${CONTAINER_NAME} cat /tmp/mesh.log 2>/dev/null | tail -30)
+  if [ "$CONC_STATUS2" = "RUNNING" ] && ! echo "$CONC_LOG2" | grep -qi "failed STANDBY_RC"; then
+    info "    ✅ Cold start succeeded on retry"
+    $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl restart gateway-mesh 2>/dev/null
+    sleep 5
+    WAIT_OK=true
+  else
+    warn "    ❌ SX1250 still not waking — check that no process holds SPI"
+    WAIT_OK=false
   fi
 fi
 
-# Border mode: start semtech-udp-forwarder for local NS connectivity
+# ── Verify AGC firmware started (M33) ──
+# A healthy cold start shows no AGC errors. "FDD mode ... not been set properly"
+# means the deployed binary predates the mailbox-2 fix.
+AGC_ERR=$($DOCKER_BIN exec ${CONTAINER_NAME} sh -c "tail -200 /tmp/mesh.log 2>/dev/null | grep -c 'FDD mode of Radio\|failed to start AGC firmware'" 2>/dev/null)
+if [ -n "$AGC_ERR" ] && [ "$AGC_ERR" -gt 0 ] 2>/dev/null; then
+  warn "  ⚠️ AGC firmware errors detected — concentratord binary may be outdated"
+  warn "     Expected: cold-start binary with AGC mailbox-2 fix (M33)"
+else
+  info "  ✅ AGC firmware started cleanly (no FDD/mailbox errors)"
+fi
+
+# Border mode: connect to the built-in NS.
+# MUST use Semtech UDP, never mqtt-forwarder: ChirpStack v4 mqtt-forwarder speaks
+# MQTT v5 while the gateway's mosquitto 1.4.15 only supports v3.1.1 ("Invalid
+# protocol version 5"). The UDP path goes forwarder → LGB → loraserver.
 if [ "$RELAY_BORDER" = "true" ]; then
-  info "  Starting semtech-udp-forwarder (border → local NS via Semtech UDP)..."
-  $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl start semtech-udp-forwarder 2>/dev/null \
+  if proc_running loraserver; then
+    info "  Built-in NS detected — using Semtech UDP path (mqtt-forwarder stays off)"
+    $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl stop mqtt-forwarder 2>/dev/null || true
+    $DOCKER_BIN exec ${CONTAINER_NAME} sh -c \
+      'printf "semtech_server = \"172.17.0.1\"\nsemtech_port = 1700\n" > /opt/chirpstack/mesh_forwarder.toml' 2>/dev/null
+    $DOCKER_BIN exec ${CONTAINER_NAME} sh -c \
+      'printf "protocol = \"udp\"\nsemtech_server = \"172.17.0.1\"\nsemtech_port = 1700\n" > /opt/chirpstack/forwarder_state.toml' 2>/dev/null
+    info "    forwarder configured for local NS (172.17.0.1:1700)"
+  fi
+  info "  Starting semtech-udp-forwarder..."
+  $DOCKER_BIN exec ${CONTAINER_NAME} supervisorctl restart semtech-udp-forwarder 2>/dev/null \
     && info "  ✅ semtech-udp-forwarder started" \
-    || warn "  ⚠️ semtech-udp-forwarder failed to start (check pyzmq installation)"
+    || warn "  ⚠️ semtech-udp-forwarder failed to start"
 fi
 
 # ── Deployment summary ──
