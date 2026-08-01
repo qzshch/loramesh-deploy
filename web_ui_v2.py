@@ -1260,6 +1260,5 @@ if __name__ == "__main__":
             except Exception:
                 pass
 
-    # Flask runs plain HTTP on 8080.
-    # nginx (if configured) handles HTTPS on the same port and proxies to Flask.
-    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
+    # Flask runs directly on 0.0.0.0:8088 (no nginx proxy needed).
+    app.run(host="0.0.0.0", port=8088, debug=False, use_reloader=False)
