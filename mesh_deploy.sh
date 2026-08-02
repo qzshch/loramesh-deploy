@@ -164,9 +164,12 @@ if [ -z "$MESH_FREQS" ]; then
   esac
 fi
 
-# Auto-detect role
+# Auto-detect role: border has full NS stack (loraserver + lora-app-server + mosquitto)
 if [ -z "$ROLE" ]; then
-  if proc_running loraserver || proc_running chirpstack; then
+  NS_COUNT=0
+  proc_running loraserver && NS_COUNT=$((NS_COUNT+1))
+  proc_running lora-app-server && NS_COUNT=$((NS_COUNT+1))
+  if [ $NS_COUNT -ge 2 ]; then
     ROLE="border"
   else
     ROLE="relay"

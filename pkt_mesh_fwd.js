@@ -384,7 +384,7 @@ class MeshForwarder {
         devAddr = raw[6]+raw[7]+raw[4]+raw[5]+raw[2]+raw[3]+raw[0]+raw[1];
       }
       const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
-      console.log(`[${ts}] UNWRAP relay=${relayId.toString('hex')} uid=${meta.uid} dev=${devAddr} hop=${hopCount} SF${DR_DATR[meta.dr]||'?'} freq=${rxpk.freq}MHz rssi=${meta.rssi} snr=${meta.snr} ${originalPhy.length}B → bridge`);
+      console.log(`[${ts}] UNWRAP relay=${relayId.toString('hex')} uid=${meta.uid} dev=${devAddr} hop=${hopCount} ${DR_DATR[meta.dr]||'?'} freq=${rxpk.freq}MHz rssi=${meta.rssi} snr=${meta.snr} ${originalPhy.length}B → bridge`);
       this._forwardSensors([newRx]);
       this.stats.fwd++;
     } else if (ROLE === 'relay') {
