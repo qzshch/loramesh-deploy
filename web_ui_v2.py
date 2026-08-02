@@ -7,6 +7,12 @@ from flask import Flask, request, jsonify, Response, session, redirect
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 
+# Suppress Flask access logs (they flood shared /tmp/mesh.log)
+import logging
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.WARNING)
+app.logger.setLevel(logging.WARNING)
+
 # ── Auth ──
 
 AUTH_CONFIG_PATH = "/opt/chirpstack/.user_permission"
@@ -222,8 +228,13 @@ def _push(line, level="INFO"):
 def _skip(line):
     if any(s in line for s in SKIP):
         return True
-    # Filter out nginx access logs for log-stream polling (too noisy)
-    if '"GET /api/logs/stream' in line or '"POST /api/login' in line:
+    # Filter Flask/HTTP noise (access logs, startup banners)
+    if any(s in line for s in [
+        '"GET /api/', '"POST /api/', '"GET / ', '"GET /login',
+        '"GET /favicon', 'Serving Flask', 'Debug mode',
+        'Running on http', 'Press CTRL+C', 'WARNING: This is a development',
+        '\x1b[',  # ANSI color codes from werkzeug
+    ]):
         return True
     return False
 
