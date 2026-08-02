@@ -160,6 +160,7 @@ if [ -z "$MESH_FREQS" ]; then
     915) MESH_FREQS="903900000,904100000,904300000" ;;
     868) MESH_FREQS="868100000,868300000,868500000" ;;
     470) MESH_FREQS="470300000,470500000,470700000" ;;
+    433) MESH_FREQS="433175000,433375000,433575000" ;;
     *)   MESH_FREQS="868100000,868300000,868500000" ;;
   esac
 fi
@@ -236,11 +237,8 @@ $DOCKER_BIN run -d \
   --network host \
   --restart unless-stopped \
   -v /etc/quagga/user_permission.conf:/etc/host_user_permission:ro \
-  -v /etc/https.crt:/etc/ssl_cert:ro \
-  -v /etc/https.key:/etc/ssl_key:ro \
   -v /opt/chirpstack/mesh_config.json:/opt/chirpstack/mesh_config.json \
   -e ROLE="$ROLE" \
-  -e SIGNING_KEY="$SIGNING_KEY" \
   -e MESH_FREQS="$MESH_FREQS" \
   -e BRIDGE_PORT="$BRIDGE_PORT" \
   -e GATEWAY_EUI="$GATEWAY_EUI" \
@@ -252,7 +250,7 @@ info "Container started"
 
 # ── Verify ──
 info "Verifying services..."
-for PROC in mesh-forwarder web-ui nginx; do
+for PROC in mesh-forwarder web-ui; do
   STATUS=$($DOCKER_BIN exec "$CONTAINER_NAME" supervisorctl status "$PROC" 2>/dev/null | awk '{print $2}')
   if [ "$STATUS" = "RUNNING" ]; then
     info "  ✅ $PROC running"
@@ -281,7 +279,6 @@ echo " Device:   $GW_MODEL, Band ${GW_BAND}MHz"
 echo " EUI:      $GATEWAY_EUI"
 echo " Mesh:     $(echo $MESH_FREQS | sed 's/000000/MHz/g; s/,/, /g')"
 echo " Web UI:   http://$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}'):8088"
-echo " HTTPS:    https://$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}'):8443"
 echo ""
 echo " Logs:   $DOCKER_BIN logs -f $CONTAINER_NAME"
 echo "============================================"
