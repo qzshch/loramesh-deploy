@@ -44,10 +44,15 @@ const MESH_FREQS = cfg('mesh-freqs', '903900000,904100000,904300000').split(',')
 const MESH_SF = parseInt(cfg('mesh-sf', '7'));
 const MESH_BW = parseInt(cfg('mesh-bw', '125000'));
 const TX_POWER = parseInt(cfg('tx-power', '27'));
-const MAX_HOP = parseInt(cfg('max-hop', '1'));
+// Web UI saves this as "max-hop-count"; accept both spellings so the UI setting
+// actually takes effect (previously only 'max-hop' was read → always 1 hop).
+const MAX_HOP = parseInt(cfg('max-hop-count', cfg('max-hop', '1')));
 // LoRaWAN JoinAccept RX1 delay (seconds). NS schedules the JoinAccept at
 // uplink_tmst + JOIN_DELAY, so we use it to index pending JoinRequests.
 const JOIN_DELAY = parseInt(cfg('join-delay', '5'));
+// Border-only: drop direct (non-mesh) uplinks so all traffic rides the mesh.
+// Web UI saves this as "border-ignore-direct" in mesh_config.json.
+const IGNORE_DIRECT = cfg('border-ignore-direct', 'false') === 'true';
 
 // ── Semtech UDP ────────────────────────────────────────────────────
 const PROTO = 2;
@@ -267,7 +272,7 @@ class MeshForwarder {
     this.dedup = new DedupCache();
     this.lastPullToken = 0;
     this.lastPullAddr = null;
-    this.stats = { rx: 0, sensor: 0, meshIn: 0, meshTx: 0, unwrap: 0, fwd: 0, dedup: 0, dlRx: 0, dlTx: 0, dlDirect: 0 };
+    this.stats = { rx: 0, sensor: 0, meshIn: 0, meshTx: 0, unwrap: 0, fwd: 0, dedup: 0, dlRx: 0, dlTx: 0, dlDirect: 0, ignoredDirect: 0 };
     this.dlCtx = new DlCtxCache();
     this.uplinkTmst = new Map(); // relay: deviceKey → concentrator tmst
     this.lastRelay = null; // { relayId, uid, dr, tmst } — fallback for downlink routing
@@ -299,7 +304,7 @@ class MeshForwarder {
     setInterval(() => {
       const s = this.stats;
       const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
-      console.log(`[${ts}] Stats: rx=${s.rx} sensor=${s.sensor} mesh_in=${s.meshIn} tx=${s.meshTx} unwrap=${s.unwrap} fwd=${s.fwd} dedup=${s.dedup} dl_rx=${s.dlRx} dl_tx=${s.dlTx} dl_dir=${s.dlDirect}`);
+      console.log(`[${ts}] Stats: rx=${s.rx} sensor=${s.sensor} mesh_in=${s.meshIn} tx=${s.meshTx} unwrap=${s.unwrap} fwd=${s.fwd} dedup=${s.dedup} dl_rx=${s.dlRx} dl_tx=${s.dlTx} dl_dir=${s.dlDirect} ign=${s.ignoredDirect}`);
     }, 60000);
   }
 
@@ -378,15 +383,28 @@ class MeshForwarder {
     if (ROLE === 'border' && sensorFrames.length) {
       this.stats.sensor += sensorFrames.length;
       const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
-      for (const { rx, phy } of sensorFrames) {
-        let devAddr = 'unknown';
-        if (phy.length >= 5) {
-          const raw = phy.slice(1, 5).toString('hex');
-          devAddr = raw[6]+raw[7]+raw[4]+raw[5]+raw[2]+raw[3]+raw[0]+raw[1];
+      if (IGNORE_DIRECT) {
+        // border-ignore-direct=true: drop direct uplinks, only mesh rides through
+        this.stats.ignoredDirect += sensorFrames.length;
+        for (const { rx, phy } of sensorFrames) {
+          let devAddr = 'unknown';
+          if (phy.length >= 5) {
+            const raw = phy.slice(1, 5).toString('hex');
+            devAddr = raw[6]+raw[7]+raw[4]+raw[5]+raw[2]+raw[3]+raw[0]+raw[1];
+          }
+          console.log(`[${ts}] IGNO direct dev=${devAddr} freq=${rx.freq}MHz ${rx.datr} rssi=${rx.rssi} snr=${rx.lsnr} ${phy.length}B`);
         }
-        console.log(`[${ts}] RX direct dev=${devAddr} freq=${rx.freq}MHz ${rx.datr} rssi=${rx.rssi} snr=${rx.lsnr} ${phy.length}B`);
+      } else {
+        for (const { rx, phy } of sensorFrames) {
+          let devAddr = 'unknown';
+          if (phy.length >= 5) {
+            const raw = phy.slice(1, 5).toString('hex');
+            devAddr = raw[6]+raw[7]+raw[4]+raw[5]+raw[2]+raw[3]+raw[0]+raw[1];
+          }
+          console.log(`[${ts}] RX direct dev=${devAddr} freq=${rx.freq}MHz ${rx.datr} rssi=${rx.rssi} snr=${rx.lsnr} ${phy.length}B`);
+        }
+        this._forwardSensors(sensorFrames.map(s => s.rx));
       }
-      this._forwardSensors(sensorFrames.map(s => s.rx));
     }
 
     // Forward stat-only packets (no rxpk, just gateway stats)
@@ -538,7 +556,15 @@ class MeshForwarder {
 
     // ── Uplink handling ──
     const result = decodeMeshUplink(SIGNING_KEY, phy);
-    if (!result) { this.stats.dedup++; return; }
+    if (!result) {
+      // Distinguish BAD MIC (signing-key mismatch) from malformed/short frame
+      // so key-function tests are visible in the log, not hidden in dedup count.
+      const badMic = phy.length >= 14 && !computeMic(SIGNING_KEY, phy.slice(0, -4)).equals(phy.slice(-4));
+      const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+      console.log(`[${ts}] BAD MESH ${badMic ? 'MIC(key?)' : 'short'} ${phy.length}B freq=${rxpk.freq}MHz`);
+      this.stats.dedup++;
+      return;
+    }
 
     const { meta, relayId, originalPhy, hopCount } = result;
 
