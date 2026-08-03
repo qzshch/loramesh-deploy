@@ -155,6 +155,72 @@ function isMeshFrame(phy) {
   return phy.length > 0 && (phy[0] >> 5) === MTYPE_PROP;
 }
 
+// ── LoRaWAN frame parsing (for downlink routing) ──────────────────
+function isJoinRequest(phy) {
+  return phy.length >= 23 && (phy[0] >> 5) === 0; // MType=000
+}
+
+function reverseBytes(buf) {
+  const r = Buffer.alloc(buf.length);
+  for (let i = 0; i < buf.length; i++) r[i] = buf[buf.length - 1 - i];
+  return r;
+}
+
+function getDeviceKey(phy) {
+  if (phy.length < 5) return null;
+  const mtype = phy[0] >> 5;
+  if (mtype === 0 && phy.length >= 23) {
+    // JoinRequest: DevEUI at bytes 1-8 (LSB first)
+    return 'jr:' + reverseBytes(phy.slice(1, 9)).toString('hex');
+  }
+  if ((mtype === 2 || mtype === 4) && phy.length >= 5) {
+    // Unconfirmed/Confirmed Data Up: DevAddr at bytes 1-4 (LSB first)
+    return 'da:' + reverseBytes(phy.slice(1, 5)).toString('hex');
+  }
+  return null;
+}
+
+// ── Downlink Metadata (6 bytes, matches gateway-mesh Rust) ─────────
+// byte 0: uid[11:4]
+// byte 1: uid[3:0] | dr[3:0]
+// byte 2-4: freq / 100 (24-bit, 100Hz resolution)
+// byte 5: power[7:4] | delay[3:0]  (delay = raw + 1 seconds)
+function encodeDownlinkMeta(uid, dr, freqHz, power, delaySec) {
+  const uidClamped = uid & 0xFFF;
+  const drClamped = dr & 0x0F;
+  const freqEnc = Math.round(freqHz / 100) & 0xFFFFFF;
+  const pwrClamped = Math.min(15, Math.max(0, power)) & 0x0F;
+  const delayRaw = Math.min(15, Math.max(0, (delaySec || 1) - 1)) & 0x0F;
+  return Buffer.from([
+    (uidClamped >> 4) & 0xFF,
+    ((uidClamped & 0x0F) << 4) | drClamped,
+    (freqEnc >> 16) & 0xFF,
+    (freqEnc >> 8) & 0xFF,
+    freqEnc & 0xFF,
+    (pwrClamped << 4) | delayRaw,
+  ]);
+}
+
+// ── Downlink Context Cache (border: device → relay mapping) ────────
+class DlCtxCache {
+  constructor(max = 256) { this.map = new Map(); this.max = max; }
+  get(key) {
+    if (!this.map.has(key)) return null;
+    const v = this.map.get(key);
+    // Move to end (LRU)
+    this.map.delete(key);
+    this.map.set(key, v);
+    return v;
+  }
+  set(key, val) {
+    if (this.map.has(key)) this.map.delete(key);
+    this.map.set(key, val);
+    if (this.map.size > this.max) {
+      this.map.delete(this.map.keys().next().value);
+    }
+  }
+}
+
 // ── Dedup Cache ────────────────────────────────────────────────────
 class DedupCache {
   constructor(size = 512) { this.set = new Set(); this.queue = []; this.max = size; }
@@ -177,7 +243,10 @@ class MeshForwarder {
     this.dedup = new DedupCache();
     this.lastPullToken = 0;
     this.lastPullAddr = null;
-    this.stats = { rx: 0, sensor: 0, meshIn: 0, meshTx: 0, unwrap: 0, fwd: 0, dedup: 0 };
+    this.stats = { rx: 0, sensor: 0, meshIn: 0, meshTx: 0, unwrap: 0, fwd: 0, dedup: 0, dlRx: 0, dlTx: 0, dlDirect: 0 };
+    this.dlCtx = new DlCtxCache();
+    this.uplinkTmst = new Map(); // relay: deviceKey → concentrator tmst
+    this.lastRelay = null; // { relayId, uid, dr, tmst } — fallback for JoinAccept
 
     // Listen socket (receives from pkt_fwd)
     this.lsock = dgram.createSocket('udp4');
@@ -192,13 +261,17 @@ class MeshForwarder {
       console.log(`  Listen: 0.0.0.0:${LISTEN_PORT}  →  Server: ${SERVER_HOST}:${SERVER_PORT}`);
       console.log(`  Mesh: SF${MESH_SF}BW${MESH_BW/1000} @ ${TX_POWER} dBm`);
       console.log(`  Freqs: ${MESH_FREQS.map(f => f/1e6)} MHz`);
+      console.log(`  Downlinks: enabled`);
     });
+
+    // Listen for PULL_RESP from gateway bridge (downlinks)
+    this.fsock.on('message', (msg) => this._onPullResp(msg));
 
     // Stats every 60s
     setInterval(() => {
       const s = this.stats;
       const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
-      console.log(`[${ts}] Stats: rx=${s.rx} sensor=${s.sensor} mesh_in=${s.meshIn} tx=${s.meshTx} unwrap=${s.unwrap} fwd=${s.fwd} dedup=${s.dedup}`);
+      console.log(`[${ts}] Stats: rx=${s.rx} sensor=${s.sensor} mesh_in=${s.meshIn} tx=${s.meshTx} unwrap=${s.unwrap} fwd=${s.fwd} dedup=${s.dedup} dl_rx=${s.dlRx} dl_tx=${s.dlTx} dl_dir=${s.dlDirect}`);
     }, 60000);
   }
 
@@ -291,6 +364,12 @@ class MeshForwarder {
   _relayWrapAndTx(phy, rxpk) {
     if (!this.lastPullAddr || !this.relayId) return;
 
+    // Cache uplink timestamp for downlink timing
+    const devKey = getDeviceKey(phy);
+    if (devKey && rxpk.tmst) {
+      this.uplinkTmst.set(devKey, rxpk.tmst);
+    }
+
     this.ulCtr = (this.ulCtr + 1) & 0xFFF;
     const datr = rxpk.datr || 'SF7BW125';
     const dr = DATR_DR[datr] !== undefined ? DATR_DR[datr] : 3;
@@ -348,6 +427,29 @@ class MeshForwarder {
   }
 
   _onMeshRx(phy, rxpk) {
+    // Check payload type: uplink (0) or downlink (1)
+    const mhdr = phy[0];
+    const payloadType = (mhdr >> 3) & 0x03;
+
+    // ── Downlink handling (relay only) ──
+    if (payloadType === 1) {
+      if (ROLE !== 'relay') return;
+      if (phy.length < 15) return; // MHDR(1)+meta(6)+relay(4)+phy(1)+MIC(4)
+      const frameNoMic = phy.slice(0, -4);
+      const expectedMic = computeMic(SIGNING_KEY, frameNoMic);
+      if (!phy.slice(-4).equals(expectedMic)) return; // bad MIC
+      const relayId = phy.slice(7, 11);
+      if (!this.relayId || !relayId.equals(this.relayId)) return; // not for us
+      const originalPhy = phy.slice(11, -4);
+      const hopCount = (mhdr & 0x07) + 1;
+      const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+      console.log(`[${ts}] MESH DL relay match! hop=${hopCount} ${originalPhy.length}B → pkt_fwd`);
+      this._sendDirectDownlink(originalPhy, rxpk.freq);
+      this.stats.dlTx++;
+      return;
+    }
+
+    // ── Uplink handling ──
     const result = decodeMeshUplink(SIGNING_KEY, phy);
     if (!result) { this.stats.dedup++; return; }
 
@@ -376,6 +478,23 @@ class MeshForwarder {
         lsnr: meta.snr,
         size: originalPhy.length,
         data: originalPhy.toString('base64'),
+      };
+      // Cache relay mapping for downlink routing
+      const devKey = getDeviceKey(originalPhy);
+      if (devKey) {
+        this.dlCtx.set(devKey, {
+          relayId: Buffer.from(relayId),
+          uid: meta.uid,
+          dr: meta.dr,
+          tmst: rxpk.tmst || 0,
+        });
+      }
+      // Always update lastRelay (fallback for JoinAccept where DevAddr key ≠ JoinRequest DevEUI key)
+      this.lastRelay = {
+        relayId: Buffer.from(relayId),
+        uid: meta.uid,
+        dr: meta.dr,
+        tmst: rxpk.tmst || 0,
       };
       // Extract DevAddr from original PHYPayload
       let devAddr = 'unknown';
@@ -408,6 +527,101 @@ class MeshForwarder {
     header[0] = PROTO; header.writeUInt16BE(token, 1); header[3] = PUSH_DATA;
     const pkt = Buffer.concat([header, gw, Buffer.from(body)]);
     this.fsock.send(pkt, SERVER_PORT, SERVER_HOST);
+  }
+
+  // ── Downlink: LGB PULL_RESP → mesh frame or direct ───────────────
+  _onPullResp(msg) {
+    if (msg.length < 4) return;
+    const ver = msg[0], token = msg.readUInt16BE(1), pktId = msg[3];
+    if (ver !== PROTO || pktId !== PULL_RESP) return;
+    if (msg.length <= 4) return;
+
+    this.stats.dlRx++;
+    let txData;
+    try {
+      txData = JSON.parse(msg.slice(4).toString());
+    } catch { return; }
+
+    const txpk = txData.txpk;
+    if (!txpk || !txpk.data) return;
+
+    const phyPayload = Buffer.from(txpk.data, 'base64');
+    const freq = txpk.freq || 0;
+    const datr = txpk.datr || 'SF7BW125';
+    const dr = DATR_DR[datr] !== undefined ? DATR_DR[datr] : 3;
+    const power = txpk.powe || 14;
+    const tmst = txpk.tmst || 0;
+    const imme = txpk.imme || false;
+
+    const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+    console.log(`[${ts}] PULL_RESP: freq=${freq}MHz datr=${datr} ${phyPayload.length}B imme=${imme} tmst=${tmst}`);
+
+    // Determine routing: mesh relay or direct
+    const devKey = getDeviceKey(phyPayload);
+    let ctx = devKey ? this.dlCtx.get(devKey) : null;
+
+    // Fallback: if no cached context (e.g. JoinAccept DevAddr ≠ JoinRequest DevEUI),
+    // use the most recent relay from the last uplink
+    if (!ctx && this.lastRelay) {
+      ctx = this.lastRelay;
+      console.log(`  Using lastRelay fallback for ${devKey || 'unknown'}`);
+    }
+
+    if (ctx && ctx.relayId) {
+      // Build mesh downlink frame
+      this.ulCtr = (this.ulCtr + 1) & 0xFFF;
+      const delaySec = 3; // account for mesh latency
+      const meta = encodeDownlinkMeta(ctx.uid, ctx.dr, Math.round(freq * 1e6), power, delaySec);
+      const mhdr = (MTYPE_PROP << 5) | (1 << 3) | 0; // MType=111, PT=Downlink, hop=1
+      const frame = Buffer.concat([
+        Buffer.from([mhdr]), meta, ctx.relayId, phyPayload
+      ]);
+      const mic = computeMic(SIGNING_KEY, frame);
+      const meshFrame = Buffer.concat([frame, mic]);
+
+      let devAddr = 'unknown';
+      if (phyPayload.length >= 5) {
+        devAddr = reverseBytes(phyPayload.slice(1, 5)).toString('hex');
+      }
+      console.log(`[${ts}] TX mesh DL: relay=${ctx.relayId.toString('hex')} dev=${devAddr} uid=${ctx.uid} ${meshFrame.length}B`);
+      this._txPullResp(meshFrame);
+    } else {
+      // Direct downlink to pkt_fwd
+      console.log(`[${ts}] TX direct DL: ${phyPayload.length}B (no relay context for ${devKey || 'unknown'})`);
+      this._sendDirectDownlink(phyPayload, freq, datr, power, tmst, imme);
+      this.stats.dlDirect++;
+    }
+  }
+
+  // ── Send PULL_RESP directly to pkt_fwd ───────────────────────────
+  _sendDirectDownlink(phyPayload, freq, datr, power, tmst, imme) {
+    if (!this.lastPullAddr) return;
+
+    datr = datr || 'SF7BW125';
+    power = power || 14;
+
+    const txpk = {
+      imme: imme || true,
+      freq: freq,
+      rfch: 0,
+      powe: power,
+      modu: 'LORA',
+      datr: datr,
+      codr: '4/5',
+      ipol: true,
+      size: phyPayload.length,
+      data: phyPayload.toString('base64'),
+    };
+    if (tmst && !imme) txpk.tmst = tmst;
+
+    const header = Buffer.alloc(4);
+    header[0] = PROTO;
+    header.writeUInt16BE(this.lastPullToken, 1);
+    header[3] = PULL_RESP;
+
+    const pkt = Buffer.concat([header, Buffer.from(JSON.stringify({ txpk }))]);
+    this.lsock.send(pkt, this.lastPullAddr.port, this.lastPullAddr.address);
+    this.stats.dlTx++;
   }
 }
 
