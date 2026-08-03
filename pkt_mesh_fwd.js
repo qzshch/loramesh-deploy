@@ -531,6 +531,14 @@ class MeshForwarder {
     header[0] = PROTO; header.writeUInt16BE(token, 1); header[3] = PUSH_DATA;
     const pkt = Buffer.concat([header, gw, Buffer.from(body)]);
     this.fsock.send(pkt, SERVER_PORT, SERVER_HOST);
+
+    // Border: also send PULL_DATA so LGB always has our address for downlinks
+    // (pkt_fwd's own PULL_DATA is only every ~30s — too slow for JoinAccept)
+    if (ROLE === 'border') {
+      const pullHdr = Buffer.alloc(4);
+      pullHdr[0] = PROTO; pullHdr.writeUInt16BE((token + 1) & 0xFFFF, 1); pullHdr[3] = PULL_DATA;
+      this.fsock.send(Buffer.concat([pullHdr, gw]), SERVER_PORT, SERVER_HOST);
+    }
   }
 
   // ── Downlink: LGB PULL_RESP → mesh frame or direct ───────────────
