@@ -829,7 +829,10 @@ class MeshForwarder {
       events: [{ heartbeat: { relayPath: hb.path.map(p => ({
         relayId: p.relayId.toString('hex'), rssi: p.rssi, snr: p.snr })) } }],
     };
-    this.mqttClient.publish(topic, JSON.stringify(payload));
+    const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+    this.mqttClient.publish(topic, JSON.stringify(payload), {}, (e) => {
+      console.log(`[${ts}] MQTT PUB ${topic} ${e ? 'ERR ' + e.message : 'OK'}`);
+    });
   }
 
   _forwardSensors(rxpkList) {
