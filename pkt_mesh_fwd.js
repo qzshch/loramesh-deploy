@@ -246,7 +246,8 @@ class MeshForwarder {
     this.stats = { rx: 0, sensor: 0, meshIn: 0, meshTx: 0, unwrap: 0, fwd: 0, dedup: 0, dlRx: 0, dlTx: 0, dlDirect: 0 };
     this.dlCtx = new DlCtxCache();
     this.uplinkTmst = new Map(); // relay: deviceKey → concentrator tmst
-    this.lastRelay = null; // { relayId, uid, dr, tmst } — fallback for JoinAccept
+    this.lastRelay = null; // { relayId, uid, dr, tmst } — fallback for downlink routing
+    this.lastJoinReq = null; // { relayId, uid, dr, tmst, wallMs } — last JoinRequest (for JoinAccept)
     this.lastUplinkTmst = null; // relay: most recent uplink tmst (for RX window timing)
     this.ulTmstMap = new Map(); // relay: uplink_id → its concentrator tmst
 
@@ -534,6 +535,18 @@ class MeshForwarder {
         dr: meta.dr,
         tmst: rxpk.tmst || 0,
       };
+      // Track JoinRequests separately so a later JoinAccept can derive the RX
+      // delay from the NS downlink tmst instead of hardcoding it.
+      // JoinRequest = MType 000 (phyPayload[0]>>5 == 0), len >= 23.
+      if (originalPhy.length >= 23 && (originalPhy[0] >> 5) === 0) {
+        this.lastJoinReq = {
+          relayId: Buffer.from(relayId),
+          uid: meta.uid,
+          dr: meta.dr,
+          tmst: rxpk.tmst || 0,
+          wallMs: Date.now(),
+        };
+      }
       // Extract DevAddr from original PHYPayload
       let devAddr = 'unknown';
       if (originalPhy.length >= 5) {
@@ -606,17 +619,34 @@ class MeshForwarder {
     const devKey = getDeviceKey(phyPayload);
     let ctx = devKey ? this.dlCtx.get(devKey) : null;
 
-    // Fallback: if no cached context (e.g. JoinAccept DevAddr ≠ JoinRequest DevEUI),
-    // use the most recent relay from the last uplink
-    if (!ctx && this.lastRelay) {
+    // Fallback for JoinAccept: its DevAddr key differs from the JoinRequest's
+    // DevEUI key, so dlCtx won't match. Route via the most recent JoinRequest
+    // (NS answers a JoinRequest within ~1s, so it is still fresh).
+    if (!ctx && this.lastJoinReq && (Date.now() - this.lastJoinReq.wallMs) < 15000) {
+      ctx = this.lastJoinReq;
+      console.log(`  JoinAccept routed via lastJoinReq (uid=${ctx.uid})`);
+    } else if (!ctx && this.lastRelay) {
       ctx = this.lastRelay;
       console.log(`  Using lastRelay fallback for ${devKey || 'unknown'}`);
+    }
+
+    // Derive the RX delay from the NS downlink tmst instead of hardcoding it.
+    // Both tmst and ctx.tmst are on the border concentrator time-base, so their
+    // difference is the relative RX delay (independent of any gateway clock).
+    // NS downlink tmst = reported uplink tmst + RX delay  =>  RX delay = tmst - ctx.tmst
+    let rxDelaySec = 0;
+    if (ctx && tmst && ctx.tmst) {
+      let diff = tmst - ctx.tmst;
+      if (diff < 0) diff += 0x100000000; // 32-bit concentrator counter wrap
+      rxDelaySec = Math.round(diff / 1e6);
     }
 
     if (ctx && ctx.relayId) {
       // Build mesh downlink frame
       this.ulCtr = (this.ulCtr + 1) & 0xFFF;
-      const delaySec = 5; // match NS JoinDelay (RX1 window for US915)
+      // Use the derived RX delay; fall back to 5s only if derivation failed
+      const delaySec = (rxDelaySec >= 1 && rxDelaySec <= 16) ? rxDelaySec : 5;
+      console.log(`  RX delay derived: tmst=${tmst} uplinkTmst=${ctx.tmst} -> ${rxDelaySec}s (using ${delaySec}s)`);
       const meta = encodeDownlinkMeta(ctx.uid, ctx.dr, Math.round(freq * 1e6), power, delaySec);
       const mhdr = (MTYPE_PROP << 5) | (1 << 3) | 0; // MType=111, PT=Downlink, hop=1
       const frame = Buffer.concat([
