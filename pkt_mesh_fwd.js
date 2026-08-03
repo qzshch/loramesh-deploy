@@ -292,6 +292,7 @@ class MeshForwarder {
       const gwMac = msg.slice(4, 12);
       this.lastPullToken = token;
       this.lastPullAddr = rinfo;
+      console.log(`[${new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'')}] PULL_DATA from ${rinfo.address}:${rinfo.port} token=${token}`);
       // ACK
       const ack = Buffer.alloc(4);
       ack[0] = PROTO; ack.writeUInt16BE(token, 1); ack[3] = PULL_ACK;
@@ -630,7 +631,10 @@ class MeshForwarder {
 
   // ── Send PULL_RESP directly to pkt_fwd ───────────────────────────
   _sendDirectDownlink(phyPayload, freq, datr, power, tmst, imme) {
-    if (!this.lastPullAddr) return;
+    if (!this.lastPullAddr) {
+      console.log(`[${new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'')}] DL: NO lastPullAddr — cannot send downlink`);
+      return;
+    }
 
     datr = datr || 'SF7BW125';
     power = power || 14;
