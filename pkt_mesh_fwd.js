@@ -247,6 +247,7 @@ class MeshForwarder {
     this.dlCtx = new DlCtxCache();
     this.uplinkTmst = new Map(); // relay: deviceKey → concentrator tmst
     this.lastRelay = null; // { relayId, uid, dr, tmst } — fallback for JoinAccept
+    this.lastUplinkTmst = null; // relay: most recent uplink tmst (for RX window timing)
 
     // Listen socket (receives from pkt_fwd)
     this.lsock = dgram.createSocket('udp4');
@@ -374,6 +375,9 @@ class MeshForwarder {
     if (devKey && rxpk.tmst) {
       this.uplinkTmst.set(devKey, rxpk.tmst);
     }
+    if (rxpk.tmst) {
+      this.lastUplinkTmst = rxpk.tmst;
+    }
 
     this.ulCtr = (this.ulCtr + 1) & 0xFFF;
     const datr = rxpk.datr || 'SF7BW125';
@@ -448,8 +452,26 @@ class MeshForwarder {
       const originalPhy = phy.slice(11, -4);
       const hopCount = (mhdr & 0x07) + 1;
       const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
-      console.log(`[${ts}] MESH DL relay match! hop=${hopCount} ${originalPhy.length}B → pkt_fwd`);
-      this._sendDirectDownlink(originalPhy, rxpk.freq);
+
+      // Extract DownlinkMetadata: uid(12bit)+dr(4bit) | freq/100(24bit) | power(4bit)+delay(4bit)
+      const meta = phy.slice(1, 7);
+      const dr = meta[1] & 0x0F;
+      const dlFreq = (meta[2] << 16 | meta[3] << 8 | meta[4]) * 100;
+      const dlPower = meta[5] >> 4;
+      const delaySec = (meta[5] & 0x0F) + 1;
+      const dlDatr = DR_DATR[dr] || 'SF7BW125';
+
+      // Schedule TX at uplinkTmst + delay (LoRaWAN RX window), NOT immediate
+      // (immediate would fire before the sensor's RX window opens)
+      let tmst = 0;
+      if (this.lastUplinkTmst) {
+        tmst = (this.lastUplinkTmst + delaySec * 1e6) & 0xFFFFFFFF;
+        console.log(`[${ts}] MESH DL relay match! hop=${hopCount} ${originalPhy.length}B freq=${dlFreq/1e6}MHz ${dlDatr} power=${dlPower} delay=${delaySec}s tmst=${this.lastUplinkTmst}+${delaySec}s=${tmst} → pkt_fwd`);
+      } else {
+        console.log(`[${ts}] MESH DL relay match! hop=${hopCount} ${originalPhy.length}B (no uplinkTmst, immediate) → pkt_fwd`);
+      }
+      const dlFreqMHz = dlFreq ? dlFreq / 1e6 : rxpk.freq;
+      this._sendDirectDownlink(originalPhy, dlFreqMHz, dlDatr, dlPower, tmst, false);
       this.stats.dlTx++;
       return;
     }
@@ -583,7 +605,7 @@ class MeshForwarder {
     if (ctx && ctx.relayId) {
       // Build mesh downlink frame
       this.ulCtr = (this.ulCtr + 1) & 0xFFF;
-      const delaySec = 3; // account for mesh latency
+      const delaySec = 5; // match NS JoinDelay (RX1 window for US915)
       const meta = encodeDownlinkMeta(ctx.uid, ctx.dr, Math.round(freq * 1e6), power, delaySec);
       const mhdr = (MTYPE_PROP << 5) | (1 << 3) | 0; // MType=111, PT=Downlink, hop=1
       const frame = Buffer.concat([
