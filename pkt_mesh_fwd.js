@@ -205,13 +205,16 @@ function getDeviceKey(phy) {
 // byte 0: uid[11:4]
 // byte 1: uid[3:0] | dr[3:0]
 // byte 2-4: freq / 100 (24-bit, 100Hz resolution)
-// byte 5: power[7:4] | delay[3:0]  (delay = raw + 1 seconds)
+// byte 5: power[7:4] | delay[3:0]
+//   delay raw = 0      -> transmit IMMEDIATELY (Class-C / imme downlink)
+//   delay raw = 1..15  -> transmit that many seconds after the uplink tmst
 function encodeDownlinkMeta(uid, dr, freqHz, power, delaySec) {
   const uidClamped = uid & 0xFFF;
   const drClamped = dr & 0x0F;
   const freqEnc = Math.round(freqHz / 100) & 0xFFFFFF;
   const pwrClamped = Math.min(15, Math.max(0, power)) & 0x0F;
-  const delayRaw = Math.min(15, Math.max(0, (delaySec || 1) - 1)) & 0x0F;
+  const delayRaw = (!delaySec || delaySec <= 0) ? 0
+                 : Math.min(15, Math.max(1, Math.round(delaySec))) & 0x0F;
   return Buffer.from([
     (uidClamped >> 4) & 0xFF,
     ((uidClamped & 0x0F) << 4) | drClamped,
@@ -494,11 +497,12 @@ class MeshForwarder {
       const dr = meta[1] & 0x0F;
       const dlFreq = (meta[2] << 16 | meta[3] << 8 | meta[4]) * 100;
       const dlPower = meta[5] >> 4;
-      const delaySec = (meta[5] & 0x0F) + 1;
+      // delayRaw: 0 = immediate (Class-C / NS imme=true), 1..15 = seconds
+      const delayRaw = meta[5] & 0x0F;
       // Region-agnostic: the 4-bit field carries SF+BW directly
       const dlDatr = drFieldToDatr(dr) || 'SF7BW125';
 
-      // Use the uplink tmst for THIS uid (the JoinRequest that triggered this
+      // Use the uplink tmst for THIS uid (the uplink that triggered this
       // downlink), not the most recent uplink — fallback to lastUplinkTmst
       const tmstHit = this.ulTmstMap.has(dlUid);
       let uplinkTmst = this.ulTmstMap.get(dlUid) || this.lastUplinkTmst || 0;
@@ -508,21 +512,26 @@ class MeshForwarder {
       // TX timestamp is already in the past and pkt_fwd will reject it (too late).
       const recvTmst = rxpk.tmst || 0;
 
-      // Schedule TX at uplinkTmst + delay (LoRaWAN RX window), NOT immediate
-      // (immediate would fire before the sensor's RX window opens)
       let tmst = 0;
-      if (uplinkTmst) {
-        tmst = ((uplinkTmst + delaySec * 1e6) >>> 0); // >>> 0 = unsigned 32-bit
+      let imme = false;
+      if (delayRaw === 0) {
+        // NS said "immediate" (Class C): transmit now, following the NS instruction.
+        imme = true;
+        console.log(`[${ts}] MESH DL uid=${dlUid} IMMEDIATE ${originalPhy.length}B freq=${dlFreq/1e6}MHz ${dlDatr} pwr=${dlPower} | recvTmst=${recvTmst} → pkt_fwd`);
+      } else if (uplinkTmst) {
+        // NS provided a tmst → schedule at uplinkTmst + delay (RX window).
+        tmst = ((uplinkTmst + delayRaw * 1e6) >>> 0); // >>> 0 = unsigned 32-bit
         // signed lead time accounting for 32-bit counter wrap
         let lead = tmst - recvTmst;
         if (lead > 0x80000000) lead -= 0x100000000;
         if (lead < -0x80000000) lead += 0x100000000;
-        console.log(`[${ts}] MESH DL uid=${dlUid} ${originalPhy.length}B freq=${dlFreq/1e6}MHz ${dlDatr} pwr=${dlPower} delay=${delaySec}s | uplinkTmst=${uplinkTmst}(${tmstHit?'HIT':'MISS'}) recvTmst=${recvTmst} txTmst=${tmst} lead=${lead}us (${(lead/1e6).toFixed(2)}s) → pkt_fwd`);
+        console.log(`[${ts}] MESH DL uid=${dlUid} ${originalPhy.length}B freq=${dlFreq/1e6}MHz ${dlDatr} pwr=${dlPower} delay=${delayRaw}s | uplinkTmst=${uplinkTmst}(${tmstHit?'HIT':'MISS'}) recvTmst=${recvTmst} txTmst=${tmst} lead=${lead}us (${(lead/1e6).toFixed(2)}s) → pkt_fwd`);
       } else {
         console.log(`[${ts}] MESH DL uid=${dlUid} ${originalPhy.length}B (no uplinkTmst, immediate) recvTmst=${recvTmst} → pkt_fwd`);
+        imme = true;
       }
       const dlFreqMHz = dlFreq ? dlFreq / 1e6 : rxpk.freq;
-      this._sendDirectDownlink(originalPhy, dlFreqMHz, dlDatr, dlPower, tmst, false);
+      this._sendDirectDownlink(originalPhy, dlFreqMHz, dlDatr, dlPower, tmst, imme);
       this.stats.dlTx++;
       return;
     }
@@ -591,7 +600,7 @@ class MeshForwarder {
         // Multiple sensors may join concurrently, so key on the unique tmst
         // (not "last JoinRequest") to match the right one later.
         const expTmst = ((jrTmst + JOIN_DELAY * 1e6) >>> 0);
-        this.joinReqs.push({ expTmst, relayId: Buffer.from(relayId), uid: meta.uid, dr: meta.dr, wallMs: Date.now() });
+        this.joinReqs.push({ expTmst, tmst: jrTmst, relayId: Buffer.from(relayId), uid: meta.uid, dr: meta.dr, wallMs: Date.now() });
         // Prune entries older than 60s
         const cutoff = Date.now() - 60000;
         this.joinReqs = this.joinReqs.filter(j => j.wallMs > cutoff);
@@ -670,7 +679,6 @@ class MeshForwarder {
     // Determine routing: mesh relay or direct
     const devKey = getDeviceKey(phyPayload);
     let ctx = devKey ? this.dlCtx.get(devKey) : null;
-    let matchedByTmst = false;
 
     // For a JoinAccept, match the originating JoinRequest EXACTLY by tmst.
     // NS sends the JoinAccept with tmst = joinreq_uplink_tmst + JOIN_DELAY, the
@@ -684,8 +692,7 @@ class MeshForwarder {
         if (d < bestDiff) { bestDiff = d; best = j; }
       }
       if (best && bestDiff <= 2e6) { // within 2s counts as a match
-        ctx = { relayId: best.relayId, uid: best.uid, dr: best.dr };
-        matchedByTmst = true;
+        ctx = { relayId: best.relayId, uid: best.uid, dr: best.dr, tmst: best.tmst };
         console.log(`  JoinAccept matched JoinReq by tmst (uid=${best.uid}, diff=${bestDiff}us, joinReqs=${this.joinReqs.length})`);
       }
     }
@@ -703,21 +710,24 @@ class MeshForwarder {
     }
 
     // The mesh DL "delay" tells the relay how long after ITS OWN uplink tmst to
-    // transmit. For a JoinAccept that is exactly JOIN_DELAY. For other downlinks
-    // derive it from the NS tmst (both on the border concentrator time-base).
-    let delaySec = JOIN_DELAY;
-    if (!matchedByTmst) {
-      let rxDelaySec = 0;
-      if (ctx && tmst && ctx.tmst) {
-        let diff = tmst - ctx.tmst;
-        if (diff < 0) diff += 0x100000000; // 32-bit concentrator counter wrap
-        rxDelaySec = Math.round(diff / 1e6);
-      }
-      delaySec = (rxDelaySec >= 1 && rxDelaySec <= 16) ? rxDelaySec : JOIN_DELAY;
-      console.log(`  RX delay derived: tmst=${tmst} uplinkTmst=${ctx && ctx.tmst} -> ${rxDelaySec}s (using ${delaySec}s)`);
+    // transmit. It is NOT hardcoded — it follows the NS timing:
+    //   imme=true  -> delay 0 (transmit immediately; Class C sensor always listening)
+    //   imme=false -> delay = NS downlink tmst − reported uplink tmst (both on the
+    //                 border concentrator time-base, so the difference is relative
+    //                 and clock-independent). This is the RX1/RX2 offset.
+    let delaySec = imme ? 0 : null;
+    if (!imme && ctx && tmst && ctx.tmst) {
+      let diff = tmst - ctx.tmst;
+      if (diff < 0) diff += 0x100000000; // 32-bit concentrator counter wrap
+      delaySec = Math.round(diff / 1e6);
+      delaySec = Math.max(1, Math.min(15, delaySec));
+      console.log(`  RX delay derived: tmst=${tmst} uplinkTmst=${ctx.tmst} -> ${delaySec}s`);
+    } else if (!imme) {
+      // No timing info to derive from — cannot schedule a timed downlink.
+      console.log(`  WARN: timed downlink without tmst/ctx, cannot schedule (devKey=${devKey||'?'})`);
     }
 
-    if (ctx && ctx.relayId) {
+    if (ctx && ctx.relayId && delaySec !== null) {
       // Build mesh downlink frame
       this.ulCtr = (this.ulCtr + 1) & 0xFFF;
       const meta = encodeDownlinkMeta(ctx.uid, dlDr, Math.round(freq * 1e6), power, delaySec);
