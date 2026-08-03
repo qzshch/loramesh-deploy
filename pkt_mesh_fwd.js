@@ -54,6 +54,27 @@ const JOIN_DELAY = parseInt(cfg('join-delay', '5'));
 // Web UI saves this as "border-ignore-direct" in mesh_config.json.
 const IGNORE_DIRECT = cfg('border-ignore-direct', 'false') === 'true';
 
+// ── Heartbeat (network topology management) ─────────────────────────
+// Relay gateways emit an Event/heartbeat frame every HEARTBEAT_INTERVAL;
+// relays that relay it append their own {relay_id, rssi, snr} to the
+// relay_path; the border terminates it, caches topology and (optionally)
+// reports a MeshEvent to the NS over MQTT. Accepts "60"/"5m"/"300s"/"1h".
+function parseInterval(v, def) {
+  const s = String(v || '').trim();
+  if (!s) return def;
+  const m = s.match(/^(\d+)\s*([smhd]?)$/i);
+  if (!m) return def;
+  const mult = { s: 1, m: 60, h: 3600, d: 86400 }[(m[2] || 's').toLowerCase()] || 1;
+  return parseInt(m[1], 10) * mult;
+}
+const HEARTBEAT_INTERVAL = parseInterval(cfg('heartbeat-interval', '5m'), 300);
+// Border → NS MeshEvent reporting (optional; requires mqtt in the image).
+const MQTT_ENABLE = cfg('mqtt-enable', 'false') === 'true';
+const MQTT_SERVER = cfg('mqtt-server', 'localhost:1883');
+const MQTT_PREFIX = cfg('mqtt-prefix', '');
+const MQTT_USERNAME = cfg('mqtt-username', '');
+const MQTT_PASSWORD = cfg('mqtt-password', '');
+
 // ── Semtech UDP ────────────────────────────────────────────────────
 const PROTO = 2;
 const PUSH_DATA = 0, PUSH_ACK = 1, PULL_DATA = 2, PULL_RESP = 3, PULL_ACK = 4, TX_ACK = 5;
@@ -181,6 +202,56 @@ function isMeshFrame(phy) {
   return phy.length > 0 && (phy[0] >> 5) === MTYPE_PROP;
 }
 
+// ── Event / Heartbeat frames (network topology management) ──────────
+// Payload layout follows chirpstack-gateway-mesh packets.rs:
+//   MHDR | timestamp(4B BE s) | source_relay_id(4B) | events...
+//   event = tag(1B, 0x00=heartbeat) + len(1B) + relay_path
+//   RelayPath(6B each): relay_id(4B) | rssi(1B, stored +ve) | snr(1B, bits5-0 signed)
+// Signed with AES-128-CMAC (same as uplink/downlink, no payload encryption).
+
+function encodeHeartbeatFrame(signingKey, sourceRelayId, relayPath, hopCount) {
+  const pathBuf = Buffer.alloc(relayPath.length * 6);
+  relayPath.forEach((p, i) => {
+    p.relayId.copy(pathBuf, i * 6);
+    pathBuf[i * 6 + 4] = (-p.rssi) & 0xFF;
+    const snrEnc = p.snr < 0 ? (p.snr + 64) : p.snr;
+    pathBuf[i * 6 + 5] = (snrEnc & 0x3F);
+  });
+  const tsBuf = Buffer.alloc(4);
+  tsBuf.writeUInt32BE(Math.floor(Date.now() / 1000) & 0xFFFFFFFF, 0);
+  const eventBody = Buffer.concat([Buffer.from([0x00, pathBuf.length]), pathBuf]);
+  const body = Buffer.concat([tsBuf, sourceRelayId, eventBody]);
+  const mhdr = (MTYPE_PROP << 5) | (2 << 3) | ((hopCount - 1) & 0x07);
+  const frame = Buffer.concat([Buffer.from([mhdr]), body]);
+  return Buffer.concat([frame, computeMic(signingKey, frame)]);
+}
+
+function decodeHeartbeatFrame(phy) {
+  // Returns { sourceRelayId, timestamp, path:[{relayId,rssi,snr}] } or null.
+  if (phy.length < 13) return null; // MHDR + ts(4) + relay(4) + tag/len(2) + MIC(4)
+  const sourceRelayId = phy.slice(5, 9);
+  const timestamp = phy.readUInt32BE(1);
+  const path = [];
+  let pos = 9;
+  while (pos + 2 <= phy.length - 4) {
+    const tag = phy[pos];
+    const len = phy[pos + 1];
+    if (tag === 0x00) {
+      for (let i = 0; i + 6 <= len; i += 6) {
+        const o = pos + 2 + i;
+        const snrRaw = phy[o + 5] & 0x3F;
+        path.push({
+          relayId: phy.slice(o, o + 4),
+          rssi: -(phy[o + 4]),
+          snr: snrRaw > 31 ? snrRaw - 64 : snrRaw,
+        });
+      }
+    }
+    pos += 2 + len;
+  }
+  return { sourceRelayId, timestamp, path };
+}
+
 // ── LoRaWAN frame parsing (for downlink routing) ──────────────────
 function isJoinRequest(phy) {
   return phy.length >= 23 && (phy[0] >> 5) === 0; // MType=000
@@ -272,7 +343,7 @@ class MeshForwarder {
     this.dedup = new DedupCache();
     this.lastPullToken = 0;
     this.lastPullAddr = null;
-    this.stats = { rx: 0, sensor: 0, meshIn: 0, meshTx: 0, unwrap: 0, fwd: 0, dedup: 0, dlRx: 0, dlTx: 0, dlDirect: 0, ignoredDirect: 0 };
+    this.stats = { rx: 0, sensor: 0, meshIn: 0, meshTx: 0, unwrap: 0, fwd: 0, dedup: 0, dlRx: 0, dlTx: 0, dlDirect: 0, ignoredDirect: 0, hbTx: 0, hbRx: 0 };
     this.dlCtx = new DlCtxCache();
     this.uplinkTmst = new Map(); // relay: deviceKey → concentrator tmst
     this.lastRelay = null; // { relayId, uid, dr, tmst } — fallback for downlink routing
@@ -280,6 +351,8 @@ class MeshForwarder {
     this.joinReqs = []; // border: pending JoinRequests [{expTmst, relayId, uid, dr, wallMs}] for exact tmst match
     this.lastUplinkTmst = null; // relay: most recent uplink tmst (for RX window timing)
     this.ulTmstMap = new Map(); // relay: uplink_id → its concentrator tmst
+    this.meshTopo = new Map(); // border: sourceRelayId(hex) → { path, lastSeen, hop }
+    this.mqttClient = null; // border: NS MeshEvent reporter
 
     // Listen socket (receives from pkt_fwd)
     this.lsock = dgram.createSocket('udp4');
@@ -295,16 +368,24 @@ class MeshForwarder {
       console.log(`  Mesh: SF${MESH_SF}BW${MESH_BW/1000} @ ${TX_POWER} dBm`);
       console.log(`  Freqs: ${MESH_FREQS.map(f => f/1e6)} MHz`);
       console.log(`  Downlinks: enabled`);
+      console.log(`  Heartbeat: ${ROLE === 'relay' ? 'every ' + HEARTBEAT_INTERVAL + 's (TX)' : (HEARTBEAT_INTERVAL > 0 ? 'topology (RX)' : 'disabled')}`);
+      if (MQTT_ENABLE) console.log(`  MQTT report: ${MQTT_SERVER}`);
     });
 
     // Listen for PULL_RESP from gateway bridge (downlinks)
     this.fsock.on('message', (msg) => this._onPullResp(msg));
 
+    // Heartbeat: relay emits every interval; border initializes MQTT reporter.
+    if (ROLE === 'relay' && HEARTBEAT_INTERVAL > 0) {
+      setInterval(() => this._sendHeartbeat(), HEARTBEAT_INTERVAL * 1000);
+    }
+    if (ROLE === 'border' && MQTT_ENABLE) this._initMqtt();
+
     // Stats every 60s
     setInterval(() => {
       const s = this.stats;
       const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
-      console.log(`[${ts}] Stats: rx=${s.rx} sensor=${s.sensor} mesh_in=${s.meshIn} tx=${s.meshTx} unwrap=${s.unwrap} fwd=${s.fwd} dedup=${s.dedup} dl_rx=${s.dlRx} dl_tx=${s.dlTx} dl_dir=${s.dlDirect} ign=${s.ignoredDirect}`);
+      console.log(`[${ts}] Stats: rx=${s.rx} sensor=${s.sensor} mesh_in=${s.meshIn} tx=${s.meshTx} unwrap=${s.unwrap} fwd=${s.fwd} dedup=${s.dedup} dl_rx=${s.dlRx} dl_tx=${s.dlTx} dl_dir=${s.dlDirect} ign=${s.ignoredDirect} hb_tx=${s.hbTx} hb_rx=${s.hbRx}`);
     }, 60000);
   }
 
@@ -492,9 +573,15 @@ class MeshForwarder {
   }
 
   _onMeshRx(phy, rxpk) {
-    // Check payload type: uplink (0) or downlink (1)
+    // Check payload type: uplink (0), downlink (1) or event/heartbeat (2)
     const mhdr = phy[0];
     const payloadType = (mhdr >> 3) & 0x03;
+
+    // ── Event handling (heartbeat, topology management) ──
+    if (payloadType === 2) {
+      this._onMeshEvent(phy, rxpk);
+      return;
+    }
 
     // ── Downlink handling (relay only) ──
     if (payloadType === 1) {
@@ -649,6 +736,100 @@ class MeshForwarder {
       const newMic = computeMic(SIGNING_KEY, newFrame);
       this._txPullResp(Buffer.concat([newFrame, newMic]));
     }
+  }
+
+  // ── Heartbeat / Event handling ────────────────────────────────────
+  _sendHeartbeat() {
+    if (!this.relayId || !this.lastPullAddr) return;
+    const frame = encodeHeartbeatFrame(SIGNING_KEY, this.relayId, [], 1);
+    this._txPullResp(frame);
+    this.stats.hbTx++;
+    const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+    console.log(`[${ts}] HB TX relay=${this.relayId.toString('hex')} path=[]`);
+  }
+
+  _onMeshEvent(phy, rxpk) {
+    if (phy.length < 13) return;
+    const frameNoMic = phy.slice(0, -4);
+    if (!phy.slice(-4).equals(computeMic(SIGNING_KEY, frameNoMic))) return; // bad MIC
+    const hb = decodeHeartbeatFrame(phy);
+    if (!hb) return;
+    const mhdr = phy[0];
+    const hopCount = (mhdr & 0x07) + 1;
+    const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+    const fmtPath = p => p.map(x => `${x.relayId.toString('hex')}(${x.rssi},${x.snr})`).join('→') || '(direct)';
+
+    if (ROLE === 'border') {
+      // Terminal: cache topology, persist for web UI, optionally report to NS.
+      this.stats.hbRx++;
+      this.meshTopo.set(hb.sourceRelayId.toString('hex'), {
+        path: hb.path.map(p => ({ relayId: p.relayId.toString('hex'), rssi: p.rssi, snr: p.snr })),
+        lastSeen: Date.now(),
+        hop: hopCount,
+      });
+      const cutoff = Date.now() - HEARTBEAT_INTERVAL * 3000;
+      for (const [k, v] of this.meshTopo) if (v.lastSeen < cutoff) this.meshTopo.delete(k);
+      this._writeTopo();
+      console.log(`[${ts}] HB RX src=${hb.sourceRelayId.toString('hex')} path=${fmtPath(hb.path)} hop=${hopCount}`);
+      this._mqttPublishHeartbeat(hb, hopCount);
+      return;
+    }
+
+    // Relay: append self to relay_path and re-broadcast (until MAX_HOP).
+    if (hopCount >= MAX_HOP) return;
+    const key = `hb:${hb.sourceRelayId.toString('hex')}:${hb.timestamp}`;
+    if (!this.dedup.add(key)) return;
+    const path = [...hb.path, {
+      relayId: Buffer.from(this.relayId),
+      rssi: parseInt(rxpk.rssi || -100),
+      snr: parseInt(rxpk.lsnr || 0),
+    }];
+    const frame = encodeHeartbeatFrame(SIGNING_KEY, hb.sourceRelayId, path, hopCount + 1);
+    this._txPullResp(frame);
+    this.stats.hbTx++;
+    console.log(`[${ts}] HB RELAY src=${hb.sourceRelayId.toString('hex')} path=${fmtPath(path)} hop=${hopCount + 1}`);
+  }
+
+  _writeTopo() {
+    const data = {
+      border: this.gwId ? this.gwId.toString('hex').toUpperCase() : '',
+      updated: new Date().toISOString(),
+      intervalSec: HEARTBEAT_INTERVAL,
+      relays: Array.from(this.meshTopo.entries()).map(([id, v]) => ({
+        relay_id: id.toUpperCase(),
+        path: v.path,
+        hop: v.hop,
+        last_seen: new Date(v.lastSeen).toISOString(),
+        online: (Date.now() - v.lastSeen) < HEARTBEAT_INTERVAL * 2000,
+      })).sort((a, b) => a.relay_id.localeCompare(b.relay_id)),
+    };
+    try { fs.writeFileSync('/opt/chirpstack/mesh_topo.json', JSON.stringify(data, null, 2)); } catch {}
+  }
+
+  _initMqtt() {
+    try { this.mqtt = require('mqtt'); } catch (e) { console.log('MQTT: mqtt module not in image'); return; }
+    const url = MQTT_SERVER.startsWith('mqtt://') || MQTT_SERVER.startsWith('mqtts://')
+      ? MQTT_SERVER : 'mqtt://' + MQTT_SERVER;
+    const opts = {};
+    if (MQTT_USERNAME) { opts.username = MQTT_USERNAME; opts.password = MQTT_PASSWORD; }
+    this.mqttClient = this.mqtt.connect(url, opts);
+    this.mqttClient.on('connect', () => console.log(`MQTT: connected ${url}`));
+    this.mqttClient.on('error', (e) => console.log(`MQTT: error ${e.message}`));
+    this.mqttClient.on('reconnect', () => console.log('MQTT: reconnecting'));
+  }
+
+  _mqttPublishHeartbeat(hb, hopCount) {
+    if (!this.mqttClient || !this.mqttClient.connected) return;
+    const gwId = this.gwId ? this.gwId.toString('hex') : '';
+    const topic = `${MQTT_PREFIX ? MQTT_PREFIX + '/' : ''}gateway/${gwId}/event/mesh`;
+    const payload = {
+      gatewayId: gwId,
+      relayId: hb.sourceRelayId.toString('hex'),
+      time: new Date().toISOString(),
+      events: [{ heartbeat: { relayPath: hb.path.map(p => ({
+        relayId: p.relayId.toString('hex'), rssi: p.rssi, snr: p.snr })) } }],
+    };
+    this.mqttClient.publish(topic, JSON.stringify(payload));
   }
 
   _forwardSensors(rxpkList) {

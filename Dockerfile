@@ -13,6 +13,9 @@ RUN apk add --no-cache \
 # Create working directory
 RUN mkdir -p /opt/chirpstack
 
+# MQTT client for border MeshEvent reporting (heartbeat → NS)
+RUN cd /opt/chirpstack && npm install mqtt --silent && rm -rf /root/.npm
+
 # Copy application files
 COPY pkt_mesh_fwd.js /opt/chirpstack/pkt_mesh_fwd.js
 COPY web_ui_v2.py /opt/chirpstack/web_ui.py

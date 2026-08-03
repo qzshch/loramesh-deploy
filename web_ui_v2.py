@@ -638,6 +638,20 @@ body{font-family:"Helvetica Neue",Helvetica,Arial,"PingFang SC","Microsoft YaHei
       </div>
     </div>
   </div>
+  <div class="card">
+    <div class="ch">Mesh Topology</div>
+    <div class="cb">
+      <div id="topoEmpty" style="color:#888;font-size:13px;margin:6px 0">No relays seen yet (border only)</div>
+      <table id="topoTable" style="width:100%;border-collapse:collapse;font-size:13px;display:none">
+        <thead><tr style="text-align:left;color:#888">
+          <th style="padding:4px 6px">Relay</th><th style="padding:4px 6px">Path</th>
+          <th style="padding:4px 6px">Hop</th><th style="padding:4px 6px">Last Seen</th><th style="padding:4px 6px">Status</th>
+        </tr></thead>
+        <tbody id="topoBody"></tbody>
+      </table>
+      <div class="brow"><button class="btn btn-s" onclick="loadTopo()">Refresh</button></div>
+    </div>
+  </div>
 </div>
 
 </div>
@@ -935,6 +949,29 @@ async function restartAll() {
   setTimeout(loadSvc, 4000);
 }
 
+async function loadTopo() {
+  let d;
+  try { const r = await fetch("/api/mesh-topology"); d = await r.json(); } catch(e) { return; }
+  const t = document.getElementById("topoTable");
+  const b = document.getElementById("topoBody");
+  const empty = document.getElementById("topoEmpty");
+  const relays = d.relays || [];
+  if (!relays.length) { t.style.display = "none"; empty.style.display = "block"; return; }
+  t.style.display = "table"; empty.style.display = "none";
+  b.innerHTML = relays.map(r => {
+    const pathStr = r.path.length
+      ? r.path.map(p => p.relayId + " (" + p.rssi + "dBm," + p.snr + "dB)").join(" &rarr; ")
+      : "direct";
+    const st = r.online ? "<span style='color:#16a34a'>online</span>" : "<span style='color:#dc2626'>offline</span>";
+    const ls = r.last_seen ? new Date(r.last_seen).toLocaleTimeString() : "-";
+    return "<tr><td style='padding:4px 6px;font-family:monospace'>" + r.relay_id + "</td>" +
+      "<td style='padding:4px 6px;font-family:monospace'>" + pathStr + "</td>" +
+      "<td style='padding:4px 6px'>" + r.hop + "</td>" +
+      "<td style='padding:4px 6px'>" + ls + "</td>" +
+      "<td style='padding:4px 6px'>" + st + "</td></tr>";
+  }).join("");
+}
+
 // Init
 document.getElementById("mqttCard").style.display = IS_BORDER ? "block" : "none";
 
@@ -958,8 +995,10 @@ document.getElementById("role").addEventListener("change", function() {
 
 loadAllCfg();
 loadSvc();
+loadTopo();
 setInterval(pollLogs, 1500);
 setInterval(loadSvc, 15000);
+setInterval(loadTopo, 15000);
 pollLogs();
 </script>
 </body>
@@ -1222,6 +1261,15 @@ def api_gateway_info():
     if not eui:
         eui = os.environ.get("GATEWAY_EUI", "").upper()
     return jsonify({"eui": eui, "role": "border" if is_border() else "relay"})
+
+@app.route("/api/mesh-topology")
+def api_mesh_topology():
+    """Mesh topology as reported by border's heartbeat aggregation."""
+    try:
+        data = json.loads(open("/opt/chirpstack/mesh_topo.json").read())
+        return jsonify(data)
+    except Exception:
+        return jsonify({"border": "", "updated": "", "intervalSec": 300, "relays": []})
 
 @app.route("/api/restart/<name>", methods=["POST"])
 def api_restart(name):
