@@ -53,17 +53,28 @@ const JOIN_DELAY = parseInt(cfg('join-delay', '5'));
 const PROTO = 2;
 const PUSH_DATA = 0, PUSH_ACK = 1, PULL_DATA = 2, PULL_RESP = 3, PULL_ACK = 4, TX_ACK = 5;
 
-// ── US915 DR table ─────────────────────────────────────────────────
-const DATR_DR = { SF10BW125:0, SF9BW125:1, SF8BW125:2, SF7BW125:3, SF8BW500:4, SF12BW500:5, SF11BW500:6 };
-const DR_DATR = {};
-for (const [k,v] of Object.entries(DATR_DR)) DR_DATR[v] = k;
-
-// US915 DOWNLINK data rates (RX1/RX2 are all 500kHz, DR8-DR13). The JoinAccept
-// is sent on one of these, so the mesh DL must carry the downlink DR (not the
-// uplink DR) or the sensor cannot decode it. Keyed by standard US915 downlink DR.
-const DL_DATR_DR = { SF12BW500:8, SF11BW500:9, SF10BW500:10, SF9BW500:11, SF8BW500:12, SF7BW500:13 };
-const DL_DR_DATR = {};
-for (const [k,v] of Object.entries(DL_DATR_DR)) DL_DR_DATR[v] = k;
+// ── Region-agnostic DR <-> 4-bit mesh-metadata field ───────────────
+// LoRaWAN DR numbers are region-specific (US915 DR0-3 up / DR8-13 down, EU868
+// DR0-5, etc.), so a DR-index lookup table only ever works for one band.
+// Instead encode the ACTUAL modulation into the 4-bit field so the same code
+// works for every region:
+//   bits[3:1] = SF index  (SF7=0 ... SF12=5)
+//   bit[0]    = bandwidth (0 = 125 kHz, 1 = 500 kHz)
+// Values 0-11 are all distinct and round-trip losslessly for SF7-SF12 x BW125/500.
+function datrToDrField(datr) {
+  const m = String(datr).match(/^SF(\d+)BW(\d+)/);
+  if (!m) return null;
+  const sfIdx = parseInt(m[1], 10) - 7;             // SF7..SF12 -> 0..5
+  if (sfIdx < 0 || sfIdx > 7) return null;
+  const bwBit = parseInt(m[2], 10) >= 500 ? 1 : 0;  // 125->0, 500->1
+  return ((sfIdx & 0x07) << 1) | bwBit;
+}
+function drFieldToDatr(drField) {
+  const sf = ((drField >> 1) & 0x07) + 7;
+  if (sf < 7 || sf > 12) return null;
+  const bw = (drField & 1) ? 500 : 125;
+  return `SF${sf}BW${bw}`;
+}
 
 // ── AES-128-CMAC (RFC 4493) ───────────────────────────────────────
 function aes128Block(key, input) {
@@ -404,7 +415,8 @@ class MeshForwarder {
       console.log(`[${jts}] RELAY JoinReq RX uid=${this.ulCtr} tmst=${rxpk.tmst} freq=${rxpk.freq}MHz`);
     }
     const datr = rxpk.datr || 'SF7BW125';
-    const dr = DATR_DR[datr] !== undefined ? DATR_DR[datr] : 3;
+    const drField0 = datrToDrField(datr);
+    const dr = drField0 !== null ? drField0 : 0; // fallback SF7BW125
     const freq = rxpk.freq || 0;
     const channel = Math.floor(freq * 10) & 0xFF;
 
@@ -483,8 +495,8 @@ class MeshForwarder {
       const dlFreq = (meta[2] << 16 | meta[3] << 8 | meta[4]) * 100;
       const dlPower = meta[5] >> 4;
       const delaySec = (meta[5] & 0x0F) + 1;
-      // Downlink DRs are US915 DR8-13 (500kHz); fall back to the uplink table
-      const dlDatr = DL_DR_DATR[dr] || DR_DATR[dr] || 'SF7BW125';
+      // Region-agnostic: the 4-bit field carries SF+BW directly
+      const dlDatr = drFieldToDatr(dr) || 'SF7BW125';
 
       // Use the uplink tmst for THIS uid (the JoinRequest that triggered this
       // downlink), not the most recent uplink — fallback to lastUplinkTmst
@@ -538,7 +550,7 @@ class MeshForwarder {
         freq: rxpk.freq || 0,
         stat: 1,
         modu: 'LORA',
-        datr: DR_DATR[meta.dr] || 'SF7BW125',
+        datr: drFieldToDatr(meta.dr) || 'SF7BW125',
         codr: '4/5',
         rssi: meta.rssi,
         lsnr: meta.snr,
@@ -591,7 +603,7 @@ class MeshForwarder {
         devAddr = raw[6]+raw[7]+raw[4]+raw[5]+raw[2]+raw[3]+raw[0]+raw[1];
       }
       const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
-      console.log(`[${ts}] UNWRAP relay=${relayId.toString('hex')} uid=${meta.uid} dev=${devAddr} hop=${hopCount} ${DR_DATR[meta.dr]||'?'} freq=${rxpk.freq}MHz rssi=${meta.rssi} snr=${meta.snr} ${originalPhy.length}B → bridge`);
+      console.log(`[${ts}] UNWRAP relay=${relayId.toString('hex')} uid=${meta.uid} dev=${devAddr} hop=${hopCount} ${drFieldToDatr(meta.dr)||'?'} freq=${rxpk.freq}MHz rssi=${meta.rssi} snr=${meta.snr} ${originalPhy.length}B → bridge`);
       this._forwardSensors([newRx]);
       this.stats.fwd++;
     } else if (ROLE === 'relay') {
@@ -644,10 +656,10 @@ class MeshForwarder {
     const phyPayload = Buffer.from(txpk.data, 'base64');
     const freq = txpk.freq || 0;
     const datr = txpk.datr || 'SF7BW125';
-    // The mesh DL must carry the DOWNLINK data rate (US915 RX1/RX2 are 500kHz
-    // DR8-13), not the uplink DR, or the sensor cannot decode the JoinAccept.
-    const dlDr = DL_DATR_DR[datr] !== undefined ? DL_DATR_DR[datr]
-               : (DATR_DR[datr] !== undefined ? DATR_DR[datr] : 8);
+    // The mesh DL must carry the DOWNLINK data rate (not the uplink DR) or the
+    // sensor cannot decode the frame. Encoded region-agnostically as SF+BW.
+    const dlDrField0 = datrToDrField(datr);
+    const dlDr = dlDrField0 !== null ? dlDrField0 : datrToDrField('SF7BW125');
     const power = txpk.powe || 14;
     const tmst = txpk.tmst || 0;
     const imme = txpk.imme || false;
