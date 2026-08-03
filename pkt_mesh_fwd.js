@@ -335,13 +335,14 @@ class MeshForwarder {
       this._onMeshRx(phy, rx);
     }
 
-    // Relay: wrap sensors → mesh TX + forward originals
+    // Relay: wrap sensors → mesh TX only (do NOT forward to LGB — duplicates
+    // arrive via border unwrap, and relay PUSH_DATA overwrites border's address
+    // in LGB, causing PULL_RESP to be sent to relay instead of border)
     if (ROLE === 'relay' && sensorFrames.length) {
       for (const { rx, phy } of sensorFrames) {
         this.stats.sensor++;
         this._relayWrapAndTx(phy, rx);
       }
-      this._forwardSensors(sensorFrames.map(s => s.rx));
     }
 
     // Border: forward sensors to NS
