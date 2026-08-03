@@ -248,6 +248,7 @@ class MeshForwarder {
     this.uplinkTmst = new Map(); // relay: deviceKey → concentrator tmst
     this.lastRelay = null; // { relayId, uid, dr, tmst } — fallback for JoinAccept
     this.lastUplinkTmst = null; // relay: most recent uplink tmst (for RX window timing)
+    this.ulTmstMap = new Map(); // relay: uplink_id → its concentrator tmst
 
     // Listen socket (receives from pkt_fwd)
     this.lsock = dgram.createSocket('udp4');
@@ -381,6 +382,10 @@ class MeshForwarder {
     }
 
     this.ulCtr = (this.ulCtr + 1) & 0xFFF;
+    // Map uplink id → concentrator tmst (for precise RX window scheduling)
+    if (rxpk.tmst) {
+      this.ulTmstMap.set(this.ulCtr, rxpk.tmst);
+    }
     const datr = rxpk.datr || 'SF7BW125';
     const dr = DATR_DR[datr] !== undefined ? DATR_DR[datr] : 3;
     const freq = rxpk.freq || 0;
@@ -456,20 +461,25 @@ class MeshForwarder {
 
       // Extract DownlinkMetadata: uid(12bit)+dr(4bit) | freq/100(24bit) | power(4bit)+delay(4bit)
       const meta = phy.slice(1, 7);
+      const dlUid = ((meta[0] << 8) | meta[1]) >> 4;
       const dr = meta[1] & 0x0F;
       const dlFreq = (meta[2] << 16 | meta[3] << 8 | meta[4]) * 100;
       const dlPower = meta[5] >> 4;
       const delaySec = (meta[5] & 0x0F) + 1;
       const dlDatr = DR_DATR[dr] || 'SF7BW125';
 
+      // Use the uplink tmst for THIS uid (the JoinRequest that triggered this
+      // downlink), not the most recent uplink — fallback to lastUplinkTmst
+      let uplinkTmst = this.ulTmstMap.get(dlUid) || this.lastUplinkTmst || 0;
+
       // Schedule TX at uplinkTmst + delay (LoRaWAN RX window), NOT immediate
       // (immediate would fire before the sensor's RX window opens)
       let tmst = 0;
-      if (this.lastUplinkTmst) {
-        tmst = ((this.lastUplinkTmst + delaySec * 1e6) >>> 0); // >>> 0 = unsigned 32-bit
-        console.log(`[${ts}] MESH DL relay match! hop=${hopCount} ${originalPhy.length}B freq=${dlFreq/1e6}MHz ${dlDatr} power=${dlPower} delay=${delaySec}s tmst=${this.lastUplinkTmst}+${delaySec}s=${tmst} → pkt_fwd`);
+      if (uplinkTmst) {
+        tmst = ((uplinkTmst + delaySec * 1e6) >>> 0); // >>> 0 = unsigned 32-bit
+        console.log(`[${ts}] MESH DL relay match! uid=${dlUid} hop=${hopCount} ${originalPhy.length}B freq=${dlFreq/1e6}MHz ${dlDatr} power=${dlPower} delay=${delaySec}s tmst=${uplinkTmst}+${delaySec}s=${tmst} → pkt_fwd`);
       } else {
-        console.log(`[${ts}] MESH DL relay match! hop=${hopCount} ${originalPhy.length}B (no uplinkTmst, immediate) → pkt_fwd`);
+        console.log(`[${ts}] MESH DL relay match! uid=${dlUid} hop=${hopCount} ${originalPhy.length}B (no uplinkTmst, immediate) → pkt_fwd`);
       }
       const dlFreqMHz = dlFreq ? dlFreq / 1e6 : rxpk.freq;
       this._sendDirectDownlink(originalPhy, dlFreqMHz, dlDatr, dlPower, tmst, false);
