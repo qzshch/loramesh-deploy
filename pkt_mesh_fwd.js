@@ -295,8 +295,12 @@ class MeshForwarder {
       const ack = Buffer.alloc(4);
       ack[0] = PROTO; ack.writeUInt16BE(token, 1); ack[3] = PULL_ACK;
       this.lsock.send(ack, rinfo.port, rinfo.address);
-      // Forward to server
-      this.fsock.send(msg, SERVER_PORT, SERVER_HOST);
+      // Only border forwards PULL_DATA to server (relay must NOT — it would
+      // overwrite the border's address mapping in LGB, causing PULL_RESP to
+      // be sent to the relay instead of the border)
+      if (ROLE === 'border') {
+        this.fsock.send(msg, SERVER_PORT, SERVER_HOST);
+      }
       // Auto-learn gateway ID
       if (!this.gwId) {
         this.gwId = gwMac;
