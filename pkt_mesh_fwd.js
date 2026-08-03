@@ -659,7 +659,11 @@ class MeshForwarder {
     header[3] = PULL_RESP;
 
     const pkt = Buffer.concat([header, Buffer.from(JSON.stringify({ txpk }))]);
-    this.lsock.send(pkt, this.lastPullAddr.port, this.lastPullAddr.address);
+    const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+    console.log(`[${ts}] DL send ${pkt.length}B to ${this.lastPullAddr.address}:${this.lastPullAddr.port} token=${this.lastPullToken} freq=${freq} ${datr} imme=${imme || true} tmst=${tmst}`);
+    this.lsock.send(pkt, this.lastPullAddr.port, this.lastPullAddr.address, (err) => {
+      if (err) console.log(`[${new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'')}] DL send ERROR: ${err.message}`);
+    });
     this.stats.dlTx++;
   }
 }
