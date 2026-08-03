@@ -466,7 +466,7 @@ class MeshForwarder {
       // (immediate would fire before the sensor's RX window opens)
       let tmst = 0;
       if (this.lastUplinkTmst) {
-        tmst = (this.lastUplinkTmst + delaySec * 1e6) & 0xFFFFFFFF;
+        tmst = ((this.lastUplinkTmst + delaySec * 1e6) >>> 0); // >>> 0 = unsigned 32-bit
         console.log(`[${ts}] MESH DL relay match! hop=${hopCount} ${originalPhy.length}B freq=${dlFreq/1e6}MHz ${dlDatr} power=${dlPower} delay=${delaySec}s tmst=${this.lastUplinkTmst}+${delaySec}s=${tmst} → pkt_fwd`);
       } else {
         console.log(`[${ts}] MESH DL relay match! hop=${hopCount} ${originalPhy.length}B (no uplinkTmst, immediate) → pkt_fwd`);
@@ -660,7 +660,7 @@ class MeshForwarder {
 
     const pkt = Buffer.concat([header, Buffer.from(JSON.stringify({ txpk }))]);
     const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
-    console.log(`[${ts}] DL send ${pkt.length}B to ${this.lastPullAddr.address}:${this.lastPullAddr.port} token=${this.lastPullToken} freq=${freq} ${datr} imme=${imme || true} tmst=${tmst}`);
+    console.log(`[${ts}] DL send ${pkt.length}B to ${this.lastPullAddr.address}:${this.lastPullAddr.port} token=${this.lastPullToken} freq=${freq} ${datr} imme=${txpk.imme} tmst=${txpk.tmst || 0}`);
     this.lsock.send(pkt, this.lastPullAddr.port, this.lastPullAddr.address, (err) => {
       if (err) console.log(`[${new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'')}] DL send ERROR: ${err.message}`);
     });
