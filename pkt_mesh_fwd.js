@@ -640,7 +640,7 @@ class MeshForwarder {
     power = power || 14;
 
     const txpk = {
-      imme: imme || true,
+      imme: imme === true,  // FIX: false || true = true bug — preserve false
       freq: freq,
       rfch: 0,
       powe: power,
@@ -651,7 +651,7 @@ class MeshForwarder {
       size: phyPayload.length,
       data: phyPayload.toString('base64'),
     };
-    if (tmst && !imme) txpk.tmst = tmst;
+    if (tmst && !txpk.imme) txpk.tmst = tmst;
 
     const header = Buffer.alloc(4);
     header[0] = PROTO;
