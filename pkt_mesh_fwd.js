@@ -74,6 +74,9 @@ const MQTT_SERVER = cfg('mqtt-server', 'localhost:1883');
 const MQTT_PREFIX = cfg('mqtt-prefix', '');
 const MQTT_USERNAME = cfg('mqtt-username', '');
 const MQTT_PASSWORD = cfg('mqtt-password', '');
+// NS backend: 'udp' = Semtech UDP to server-host:server-port (default, LGB or
+// external UDP NS); 'mqtt' = ChirpStack v4 gateway MQTT backend (native).
+const BACKEND = cfg('backend', 'udp');
 
 // ── Semtech UDP ────────────────────────────────────────────────────
 const PROTO = 2;
@@ -252,6 +255,52 @@ function decodeHeartbeatFrame(phy) {
   return { sourceRelayId, timestamp, path };
 }
 
+// ── NS backend conversions (Semtech UDP rxpk ↔ ChirpStack gw protobuf-JSON) ──
+function modToDatr(mod) {
+  if (!mod || !mod.lora) return 'SF7BW125';
+  const bw = mod.lora.bandwidth || 125000;
+  const sf = mod.lora.spreadingFactor || 7;
+  return `SF${sf}BW${bw / 1000}`;
+}
+
+function parseDelay(s) {
+  const m = String(s).match(/([\d.]+)\s*([smh]?)/i);
+  if (!m) return 1;
+  const mult = { s: 1, m: 60, h: 3600 }[(m[2] || 's').toLowerCase()] || 1;
+  return Math.max(1, Math.round(parseFloat(m[1]) * mult));
+}
+
+// rxpk (Semtech UDP) → ChirpStack gw.UplinkFrame (protobuf-JSON mapping).
+// Byte fields (phyPayload, context) are base64; gatewayId is hex; JSON
+// detection is "payload contains 'gatewayId'".
+function rxpkToUplinkFrame(rxpk, gwId, uplinkId) {
+  const m = /^SF(\d+)BW(\d+)/.exec(rxpk.datr || '');
+  const sf = m ? parseInt(m[1], 10) : 7;
+  const bw = m ? parseInt(m[2], 10) * 1000 : 125000;
+  const cr = String(rxpk.codr || '4/5').replace('/', '_');
+  const tmstBuf = Buffer.alloc(4);
+  tmstBuf.writeUInt32BE((rxpk.tmst || 0) >>> 0, 0);
+  return {
+    phyPayload: rxpk.data,
+    txInfo: {
+      frequency: Math.round((rxpk.freq || 0) * 1e6),
+      modulation: { lora: { bandwidth: bw, spreadingFactor: sf, codeRate: 'CR_' + cr } },
+    },
+    rxInfo: [{
+      gatewayId: gwId,
+      uplinkId,
+      time: rxpk.time || new Date().toISOString(),
+      rssi: rxpk.rssi || 0,
+      snr: rxpk.lsnr || 0,
+      channel: rxpk.chan || 0,
+      rfChain: rxpk.rfch || 0,
+      board: 0,
+      antenna: 0,
+      context: tmstBuf.toString('base64'),
+    }],
+  };
+}
+
 // ── LoRaWAN frame parsing (for downlink routing) ──────────────────
 function isJoinRequest(phy) {
   return phy.length >= 23 && (phy[0] >> 5) === 0; // MType=000
@@ -379,13 +428,28 @@ class MeshForwarder {
     if (ROLE === 'relay' && HEARTBEAT_INTERVAL > 0) {
       setInterval(() => this._sendHeartbeat(), HEARTBEAT_INTERVAL * 1000);
     }
-    if (ROLE === 'border' && MQTT_ENABLE) this._initMqtt();
+    if (ROLE === 'border' && (MQTT_ENABLE || BACKEND === 'mqtt')) this._initMqtt();
 
     // Stats every 60s
     setInterval(() => {
       const s = this.stats;
       const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
       console.log(`[${ts}] Stats: rx=${s.rx} sensor=${s.sensor} mesh_in=${s.meshIn} tx=${s.meshTx} unwrap=${s.unwrap} fwd=${s.fwd} dedup=${s.dedup} dl_rx=${s.dlRx} dl_tx=${s.dlTx} dl_dir=${s.dlDirect} ign=${s.ignoredDirect} hb_tx=${s.hbTx} hb_rx=${s.hbRx}`);
+      // MQTT backend: report gateway stats so NS tracks gateway online state.
+      if (BACKEND === 'mqtt' && ROLE === 'border' && this.mqttClient && this.mqttClient.connected) {
+        const gwId = this.gwId ? this.gwId.toString('hex') : '';
+        if (gwId) {
+          const st = `${MQTT_PREFIX ? MQTT_PREFIX + '/' : ''}gateway/${gwId}/event/stats`;
+          this.mqttClient.publish(st, JSON.stringify({
+            gatewayId: gwId,
+            time: new Date().toISOString(),
+            rxPacketsReceived: s.rx,
+            rxPacketsReceivedOk: s.rx,
+            txPacketsReceived: s.dlRx,
+            txPacketsEmitted: s.dlTx + s.meshTx,
+          }));
+        }
+      }
     }, 60000);
   }
 
@@ -421,6 +485,12 @@ class MeshForwarder {
         this.gwId = gwMac;
         this.relayId = gwMac.slice(4, 8);
         console.log(`Gateway ID: ${gwMac.toString('hex').toUpperCase()}  Relay ID: ${this.relayId.toString('hex')}`);
+        // MQTT backend: subscribe NS downlink commands once gwId is known.
+        if (BACKEND === 'mqtt' && this.mqttClient) {
+          const sub = `${MQTT_PREFIX ? MQTT_PREFIX + '/' : ''}gateway/${gwMac.toString('hex')}/command/down`;
+          this.mqttClient.subscribe(sub, { qos: 0 });
+          console.log(`MQTT: subscribed ${sub}`);
+        }
       }
     }
     // TX_ACK: ignore
@@ -816,6 +886,7 @@ class MeshForwarder {
     this.mqttClient.on('connect', () => console.log(`MQTT: connected ${url}`));
     this.mqttClient.on('error', (e) => console.log(`MQTT: error ${e.message}`));
     this.mqttClient.on('reconnect', () => console.log('MQTT: reconnecting'));
+    this.mqttClient.on('message', (topic, payload) => this._onMqttMessage(topic, payload));
   }
 
   _mqttPublishHeartbeat(hb, hopCount) {
@@ -836,6 +907,10 @@ class MeshForwarder {
   }
 
   _forwardSensors(rxpkList) {
+    if (BACKEND === 'mqtt') {
+      this._mqttUplink(rxpkList);
+      return;
+    }
     const gw = this.gwId || Buffer.alloc(8);
     const body = JSON.stringify({
       rxpk: rxpkList,
@@ -856,7 +931,56 @@ class MeshForwarder {
     }
   }
 
-  // ── Downlink: LGB PULL_RESP → mesh frame or direct ───────────────
+  // ── MQTT backend (ChirpStack v4 gateway MQTT) ─────────────────────
+  _mqttUplink(rxpkList) {
+    if (!this.mqttClient || !this.mqttClient.connected) return;
+    const gwId = this.gwId ? this.gwId.toString('hex') : '';
+    if (!gwId) return;
+    const topic = `${MQTT_PREFIX ? MQTT_PREFIX + '/' : ''}gateway/${gwId}/event/up`;
+    for (const rxpk of rxpkList) {
+      this.ulCtr = (this.ulCtr + 1) & 0xFFF;
+      const frame = rxpkToUplinkFrame(rxpk, gwId, this.ulCtr);
+      this.mqttClient.publish(topic, JSON.stringify(frame));
+    }
+  }
+
+  _mqttAck(token) {
+    if (!this.mqttClient || !this.mqttClient.connected) return;
+    const gwId = this.gwId ? this.gwId.toString('hex') : '';
+    if (!gwId) return;
+    const topic = `${MQTT_PREFIX ? MQTT_PREFIX + '/' : ''}gateway/${gwId}/event/ack`;
+    this.mqttClient.publish(topic, JSON.stringify({ gatewayId: gwId, token: token || 0, error: '' }));
+  }
+
+  _onMqttMessage(topic, payload) {
+    if (topic.endsWith('/command/down')) this._onMqttDown(topic, payload);
+  }
+
+  _onMqttDown(topic, payload) {
+    let cmd;
+    try { cmd = JSON.parse(payload.toString()); } catch { return; }
+    if (!cmd.items || !cmd.items.length) return;
+    const item = cmd.items[0];
+    if (!item.phyPayload) return;
+    const txInfo = item.txInfo || {};
+    const txpk = {
+      data: item.phyPayload,
+      freq: (txInfo.frequency || 0) / 1e6,
+      powe: txInfo.power || 14,
+      datr: modToDatr(txInfo.modulation),
+      imme: txInfo.timing === 'IMMEDIATELY',
+    };
+    // ChirpStack MQTT downlink carries delay as relative duration (e.g. "1s"),
+    // not an absolute concentrator tmst. Pass it to _handleTxpk which derives
+    // the mesh-DL delay from it (relay does the precise RX-window timing).
+    if (txInfo.timing === 'DELAY' && txInfo.delayTimingInfo && txInfo.delayTimingInfo.delay) {
+      txpk.chirpstackDelaySec = parseDelay(txInfo.delayTimingInfo.delay);
+    }
+    this._handleTxpk(txpk);
+    this._mqttAck(cmd.token || 0);
+  }
+
+  // ── Downlink: PULL_RESP / ChirpStack downlink → mesh frame or direct ──
   _onPullResp(msg) {
     if (msg.length < 4) return;
     const ver = msg[0], token = msg.readUInt16BE(1), pktId = msg[3];
@@ -872,6 +996,12 @@ class MeshForwarder {
     const txpk = txData.txpk;
     if (!txpk || !txpk.data) return;
 
+    this._handleTxpk(txpk);
+  }
+
+  // Shared downlink handler: routes a txpk (LGB PULL_RESP or ChirpStack MQTT
+  // downlink) to a mesh-downlink frame (via relay) or direct PULL_RESP.
+  _handleTxpk(txpk) {
     const phyPayload = Buffer.from(txpk.data, 'base64');
     const freq = txpk.freq || 0;
     const datr = txpk.datr || 'SF7BW125';
@@ -926,7 +1056,11 @@ class MeshForwarder {
     //                 border concentrator time-base, so the difference is relative
     //                 and clock-independent). This is the RX1/RX2 offset.
     let delaySec = imme ? 0 : null;
-    if (!imme && ctx && tmst && ctx.tmst) {
+    if (txpk.chirpstackDelaySec) {
+      // ChirpStack MQTT downlink carries a relative delay (e.g. "1s"); use it
+      // directly for the mesh-DL delay (relay does precise RX-window timing).
+      delaySec = Math.max(1, Math.min(15, txpk.chirpstackDelaySec));
+    } else if (!imme && ctx && tmst && ctx.tmst) {
       let diff = tmst - ctx.tmst;
       if (diff < 0) diff += 0x100000000; // 32-bit concentrator counter wrap
       delaySec = Math.round(diff / 1e6);

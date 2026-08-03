@@ -790,18 +790,22 @@ async function loadMeshCfg() {
   }
 }
 
-async function loadMqttCfg() {
-  const r = await fetch("/api/config/mqtt");
-  const c = await r.json();
-  document.getElementById("mqttServer").value = c.mqtt_server || "";
-  document.getElementById("mqttPrefix").value = c.mqtt_topic_prefix || "";
-  document.getElementById("mqttUser").value = c.mqtt_username || "";
-  document.getElementById("mqttPass").value = c.mqtt_password || "";
-  document.getElementById("mqttQos").value = String(c.mqtt_qos||0);
-  document.getElementById("mqttJson").checked = c.mqtt_json||false;
+async function loadBackendCfg() {
+  try {
+    const r = await fetch("/api/config/backend");
+    const c = await r.json();
+    document.getElementById("fwdProto").value = c.backend || "udp";
+    onProtoChange(c.backend || "udp");
+    document.getElementById("udpServer").value = c.server_host || "";
+    document.getElementById("udpPort").value = c.server_port || 1700;
+    document.getElementById("mqttServer").value = c.mqtt_server || "";
+    document.getElementById("mqttPrefix").value = c.mqtt_prefix || "";
+    document.getElementById("mqttUser").value = c.mqtt_username || "";
+    document.getElementById("mqttPass").value = c.mqtt_password || "";
+  } catch(e) {}
 }
 
-function loadAllCfg() { loadMeshCfg(); loadMqttCfg(); loadUdpCfg(); }
+function loadAllCfg() { loadMeshCfg(); loadBackendCfg(); }
 
 function setLoading(btnId, loading) {
   const btn = document.getElementById(btnId);
@@ -866,23 +870,19 @@ async function saveMeshCfg(e) {
 async function saveMqttCfg(e) {
   e.preventDefault();
   const server = document.getElementById("mqttServer").value;
-  if (!server.startsWith("tcp://") && !server.startsWith("ssl://")) {
-    toast("MQTT Server must start with tcp:// or ssl://", false);
-    return;
-  }
+  if (!server) { toast("MQTT Server is required", false); return; }
   setLoading("mqttSaveBtn", true);
   try {
     const cfg = {
+      backend: "mqtt",
       mqtt_server: server,
-      mqtt_topic_prefix: document.getElementById("mqttPrefix").value,
       mqtt_username: document.getElementById("mqttUser").value,
       mqtt_password: document.getElementById("mqttPass").value,
-      mqtt_qos: parseInt(document.getElementById("mqttQos").value),
-      mqtt_json: document.getElementById("mqttJson").checked,
+      mqtt_prefix: document.getElementById("mqttPrefix").value,
     };
-    const r = await fetch("/api/config/mqtt",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cfg)});
+    const r = await fetch("/api/config/backend",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cfg)});
     const d = await r.json();
-    if (d.ok) toast("MQTT config saved & forwarder restarted", true);
+    if (d.ok) toast("ChirpStack MQTT backend saved & forwarder restarted", true);
     else toast("Error: "+(d.error||"unknown"), false);
   } catch(e) {
     toast("Request failed: "+e.message, false);
@@ -895,19 +895,6 @@ function onProtoChange(proto) {
   document.getElementById("udpFields").style.display = proto === "udp" ? "block" : "none";
 }
 
-async function loadUdpCfg() {
-  try {
-    const r = await fetch("/api/config/udp");
-    const c = await r.json();
-    if (c.semtech_server) document.getElementById("udpServer").value = c.semtech_server;
-    if (c.semtech_port) document.getElementById("udpPort").value = c.semtech_port;
-    if (c.protocol === "udp") {
-      document.getElementById("fwdProto").value = "udp";
-      onProtoChange("udp");
-    }
-  } catch(e) {}
-}
-
 async function saveUdpCfg(e) {
   e.preventDefault();
   const server = document.getElementById("udpServer").value;
@@ -916,9 +903,9 @@ async function saveUdpCfg(e) {
   if (isNaN(port) || port < 1 || port > 65535) { toast("Port must be 1-65535", false); return; }
   setLoading("udpSaveBtn", true);
   try {
-    const r = await fetch("/api/config/udp",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({semtech_server:server, semtech_port:port})});
+    const r = await fetch("/api/config/backend",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({backend:"udp", server_host:server, server_port:port})});
     const d = await r.json();
-    if (d.ok) toast("Semtech UDP config saved & forwarder restarted", true);
+    if (d.ok) toast("Semtech UDP backend saved & forwarder restarted", true);
     else toast("Error: "+(d.error||"unknown"), false);
   } catch(e) {
     toast("Request failed: "+e.message, false);
@@ -1184,6 +1171,55 @@ def api_set_udp():
         except Exception:
             pass
     return jsonify({"ok": ok})
+
+# ── NS backend config (Semtech UDP or ChirpStack MQTT) ──────────────
+@app.route("/api/config/backend", methods=["GET"])
+def api_get_backend():
+    try:
+        mc = json.loads(open(MESH_CONFIG_PATH).read())
+    except Exception:
+        mc = {}
+    return jsonify({
+        "backend": mc.get("backend", "udp"),
+        "server_host": mc.get("server-host", "127.0.0.1"),
+        "server_port": int(mc.get("server-port", 1710)),
+        "mqtt_server": mc.get("mqtt-server", "127.0.0.1:1883"),
+        "mqtt_username": mc.get("mqtt-username", ""),
+        "mqtt_password": mc.get("mqtt-password", ""),
+        "mqtt_prefix": mc.get("mqtt-prefix", ""),
+    })
+
+@app.route("/api/config/backend", methods=["POST"])
+def api_set_backend():
+    if not is_border():
+        return jsonify({"error": "Forwarding config only available on Border"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        mc = json.loads(open(MESH_CONFIG_PATH).read())
+    except Exception:
+        mc = {}
+    backend = data.get("backend", "udp")
+    mc["backend"] = backend
+    if backend == "udp":
+        mc["server-host"] = data.get("server_host", mc.get("server-host", "127.0.0.1"))
+        mc["server-port"] = str(int(data.get("server_port", int(mc.get("server-port", 1710)))))
+    else:
+        # Strip scheme — pkt_mesh_fwd.js adds mqtt:// itself.
+        ms = data.get("mqtt_server", mc.get("mqtt-server", "127.0.0.1:1883"))
+        ms = re.sub(r'^(tcp|mqtt|ssl|mqtts)://', '', ms)
+        mc["mqtt-server"] = ms
+        mc["mqtt-username"] = data.get("mqtt_username", mc.get("mqtt-username", ""))
+        mc["mqtt-password"] = data.get("mqtt_password", mc.get("mqtt-password", ""))
+        mc["mqtt-prefix"] = data.get("mqtt_prefix", mc.get("mqtt-prefix", ""))
+    try:
+        open(MESH_CONFIG_PATH, "w").write(json.dumps(mc, indent=2))
+    except Exception:
+        return jsonify({"ok": False})
+    try:
+        subprocess.run(["supervisorctl", "-c", "/etc/supervisord.conf", "restart", "mesh-forwarder"], timeout=10, capture_output=True)
+    except Exception:
+        pass
+    return jsonify({"ok": True})
 
 def _read_forwarder_cfg():
     """Read forwarder protocol config."""
