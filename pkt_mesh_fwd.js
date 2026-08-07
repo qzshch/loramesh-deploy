@@ -38,6 +38,10 @@ function cfg(name, fallback) {
 const ROLE = cfg('role', 'relay');
 const SIGNING_KEY = Buffer.from(cfg('signing-key', '00112233445566778899aabbccddeeff'), 'hex');
 const LISTEN_PORT = parseInt(cfg('listen-port', '1700'));
+// NS backend target. With backend='mqtt', the forwarder publishes ChirpStack v4
+// gateway events directly to the broker and SERVER_HOST/SERVER_PORT (UDP LGB) are
+// not used. With backend='udp' (default) the Semtech UDP PUSH_DATA path is used.
+const BACKEND = cfg('backend', 'udp');
 const SERVER_HOST = cfg('server-host', '127.0.0.1');
 const SERVER_PORT = parseInt(cfg('server-port', '1710'));
 const MESH_FREQS = cfg('mesh-freqs', '903900000,904100000,904300000').split(',').map(Number);
@@ -74,9 +78,6 @@ const MQTT_SERVER = cfg('mqtt-server', 'localhost:1883');
 const MQTT_PREFIX = cfg('mqtt-prefix', '');
 const MQTT_USERNAME = cfg('mqtt-username', '');
 const MQTT_PASSWORD = cfg('mqtt-password', '');
-// NS backend: 'udp' = Semtech UDP to server-host:server-port (default, LGB or
-// external UDP NS); 'mqtt' = ChirpStack v4 gateway MQTT backend (native).
-const BACKEND = cfg('backend', 'udp');
 
 // ── Semtech UDP ────────────────────────────────────────────────────
 const PROTO = 2;
@@ -286,7 +287,7 @@ function rxpkToUplinkFrame(rxpk, gwId, uplinkId) {
       frequency: Math.round((rxpk.freq || 0) * 1e6),
       modulation: { lora: { bandwidth: bw, spreadingFactor: sf, codeRate: 'CR_' + cr } },
     },
-    rxInfo: [{
+    rxInfo: {
       gatewayId: gwId,
       uplinkId,
       time: rxpk.time || new Date().toISOString(),
@@ -297,7 +298,7 @@ function rxpkToUplinkFrame(rxpk, gwId, uplinkId) {
       board: 0,
       antenna: 0,
       context: tmstBuf.toString('base64'),
-    }],
+    },
   };
 }
 
