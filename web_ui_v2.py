@@ -285,7 +285,6 @@ def read_mesh_cfg():
     freqs_str = cfg.get("mesh-freqs", "")
     freqs = [f.strip() for f in freqs_str.split(",") if f.strip()] if freqs_str else []
     return {
-        "logging_level": cfg.get("logging-level", "INFO"),
         "signing_key": cfg.get("signing-key", ""),
         "border_gateway": role == "border",
         "heartbeat_interval": cfg.get("heartbeat-interval", "5m"),
@@ -293,10 +292,8 @@ def read_mesh_cfg():
         "border_ignore_direct": cfg.get("border-ignore-direct", False),
         "frequencies": freqs,
         "tx_power": int(cfg.get("tx-power", 16)),
-        "modulation": cfg.get("modulation", "LORA"),
         "spreading_factor": int(cfg.get("mesh-sf", 7)),
         "bandwidth": int(cfg.get("mesh-bw", 125000)),
-        "code_rate": cfg.get("code-rate", "4/5"),
     }
 
 def write_mesh_cfg(cfg):
@@ -316,12 +313,9 @@ def write_mesh_cfg(cfg):
     }
     # Preserve optional fields if present in request or existing config
     for old_key, new_key in [
-        ("logging_level", "logging-level"),
         ("heartbeat_interval", "heartbeat-interval"),
         ("max_hop_count", "max-hop-count"),
         ("border_ignore_direct", "border-ignore-direct"),
-        ("modulation", "modulation"),
-        ("code_rate", "code-rate"),
     ]:
         val = cfg.get(old_key)
         if val is not None:
@@ -532,12 +526,6 @@ body{font-family:"Helvetica Neue",Helvetica,Arial,"PingFang SC","Microsoft YaHei
           </div>
           <div class="fg"><label>Bandwidth</label>
             <select id="bw"><option value="125000">125 kHz</option><option value="250000">250 kHz</option><option value="500000">500 kHz</option></select>
-          </div>
-          <div class="fg"><label>Code Rate</label>
-            <select id="cr"><option>4/5</option><option>4/6</option><option>4/7</option><option>4/8</option></select>
-          </div>
-          <div class="fg"><label>Log Level</label>
-            <select id="ll"><option>TRACE</option><option>DEBUG</option><option>INFO</option><option>WARN</option><option>ERROR</option></select>
           </div>
         </div>
         <!-- Border-only: ignore direct -->
@@ -781,8 +769,6 @@ async function loadMeshCfg() {
   document.getElementById("hb").value = c.heartbeat_interval || "5m";
   document.getElementById("sf").value = String(c.spreading_factor||7);
   document.getElementById("bw").value = String(c.bandwidth||125000);
-  document.getElementById("cr").value = c.code_rate||"4/5";
-  document.getElementById("ll").value = c.logging_level||"INFO";
   // Show border-specific options based on config, not just env
   if (c.border_gateway) {
     document.getElementById("borderDirectBlock").style.display = "flex";
@@ -850,9 +836,6 @@ async function saveMeshCfg(e) {
     heartbeat_interval: hb,
     spreading_factor: parseInt(document.getElementById("sf").value),
     bandwidth: parseInt(document.getElementById("bw").value),
-    code_rate: document.getElementById("cr").value,
-    logging_level: document.getElementById("ll").value,
-    modulation: "LORA",
   };
   if (isBorder) cfg.border_ignore_direct = document.getElementById("ign").checked;
   setLoading("meshSaveBtn", true);
