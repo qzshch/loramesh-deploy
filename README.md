@@ -26,6 +26,60 @@
    → LGB → 内置 loraserver      → ChirpStack v4 NS
 ```
 
+## 工作机制（对应 `pkt_mesh_fwd.js`）
+
+### 角色怎么定
+
+`pkt_mesh_fwd.js:38` 读 `/opt/chirpstack/mesh_config.json` 的 `"role"` 字段（`--role` CLI 参数覆盖，默认 `relay`）。部署脚本写入：`--relay` / `--border` 显式指定；不带参数时自动检测——网关有 loraserver（内置 NS）→ border，否则 relay。一台网关同时只扮演一个角色，Web UI 可运行时切换。
+
+| 角色 | 位置 | 干的事 |
+|------|------|--------|
+| **relay** | 传感器侧 | 收到传感器 LoRa 帧 → 包成 MType=111 mesh 帧 → PULL_RESP 让本地 pkt_fwd 在 mesh 频点广播。**不转发给 LGB**（会让 border 收不到上行） |
+| **border** | NS 侧 | 收到 mesh 帧 → 解包恢复原始 PHYPayload → 上报 NS。**转发 PULL_DATA 给 LGB**（relay 不转发，否则会覆盖 LGB 里 border 的地址映射，下行会发错网关） |
+
+### 组网：无线洪泛 + 去重 + 跳数上限
+
+- 所有网关在 mesh 频点（如 US915 `903.9/904.1/904.3 MHz`）上监听同一信道
+- **上行洪泛**：relay 包好 mesh 帧广播；中间 relay 收到后把 MHDR 的 hop 字段 +1、重算 MIC 重广播，到 `max-hop-count` 停；border 收到即终止
+- **去重**：key = `uid:relayId`（uid 是 relay 侧 12-bit 递增计数），防环；`relayId == 自己` 的自环帧直接丢
+- **下行是单跳**：mesh 下行帧只带目标 `relayId`，只有匹配的 relay 发射，中间 relay 直接丢弃（当前不支持下行多跳，mesh 下行帧里没有 hop 转发逻辑）
+- **心跳组网**：relay 每 `heartbeat-interval` 发一个 Event/heartbeat 帧，中间 relay 把自己的 `{relay_id, rssi, snr}` 追加到 `relay_path`，border 缓存拓扑写 `/opt/chirpstack/mesh_topo.json`（Web UI 拓扑卡片）。心跳只用于监控，**不参与下行选路**
+
+### 怎么认出是哪个 relay 的包
+
+mesh 帧里带 4 字节 `relayId` = 网关 EUI 的后 4 字节（`gwMac.slice(4,8)`）。border 解包时取出，日志打 `UNWRAP relay=xxx`，并按设备 key 缓存映射供下行路由用：
+
+| 帧类型 | 设备 key | 来源 |
+|--------|----------|------|
+| JoinRequest | `jr:<DevEUI>` | `phy.slice(1,9)` 反转 |
+| 数据上行 | `da:<DevAddr>` | `phy.slice(1,5)` 反转 |
+
+### Border 上行：mesh 帧解包上报
+
+```
+relay 传感器帧 → 包 mesh 帧 → relay 的 pkt_fwd 广播
+border 的 pkt_fwd 收到 mesh 帧（当普通射频包）→ PUSH_DATA 127.0.0.1:1700 → pkt_mesh_fwd.js
+  isMeshFrame()：phy[0]>>5 == 7（MType=111 专有帧）→ 判为 mesh 帧
+  → decodeMeshUplink：MIC 校验 + 取 relayId + originalPhy
+  → unwrap 重构 rxpk（rssi/snr 用 mesh meta 里 relay 封装的传感器原始信号）
+  → backend=udp:   PUSH_DATA 127.0.0.1:1710 → LGB → MQTT → NS
+  → backend=mqtt:  ChirpStack v4 gateway/+/event/up
+```
+
+border 直接收到的普通传感器帧（非 mesh）：`border-ignore-direct=true` 时丢弃；否则也照常上报（那个设备直连 border，不经 mesh）。
+
+### Border 下行：本机直发 vs 组 mesh（关键判定）
+
+判定依据是 **`dlCtx` 缓存里有没有这个设备的 relay 记录**——即这个设备上行是不是走 mesh 上来的：
+
+1. 每次 unwrap 上行时，border 按设备 key 记下 `device → {relayId, uid, dr, tmst}`（`dlCtx`）
+2. NS 下行进 `_handleTxpk`：
+   - **查得到 ctx（设备走过 mesh）→ 组 mesh 下行帧**：meta 6 字节带 `ctx.relayId + uid + freq + power + delay`，PULL_RESP 给本地 pkt_fwd 在 mesh 频点广播。目标 relay 收到后 `relayId == 自己` 才按 meta 的 freq/dr/`上行tmst+delay` 精确发射给传感器
+   - **查不到 ctx（设备直连 border）→ 本机直发**：原帧按 NS 给的 freq/datr 直接 PULL_RESP 射频发出
+3. JoinAccept 特殊处理：JoinAccept 的 key（DevAddr）和 JoinRequest 的 key（DevEUI）对不上，border 用 NS 下行 `tmst` 精确匹配 `joinReqs[]`（`expTmst = 上行tmst + join-delay`），匹配不到再 fallback 最近一次 JoinRequest
+
+下行 delay 不硬编码：`imme=true`（Class C）→ delay=0 立即发；`imme=false` → delay = NS 下行 tmst − 上行 tmst（border 本地时基差值，时钟无关），或 ChirpStack MQTT 下行的相对延迟（如 `"1s"`）。relay 端用 `ulTmstMap[uid]` 查回精确上行 tmst。
+
 ## 目录
 
 ### 当前核心
