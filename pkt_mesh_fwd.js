@@ -4,6 +4,7 @@
  *
  * UDP proxy: pkt_fwd ↔ gateway-bridge, with mesh (MType=111) wrapping/unwrapping.
  *   Relay:  sensor → wrap MType=111 → TX via PULL_RESP
+ *           mesh downlink not addressed to us → hop+1 re-broadcast (multi-hop)
  *   Border: unwrap MType=111 → forward original PHYPayload
  */
 
@@ -51,6 +52,13 @@ const TX_POWER = parseInt(cfg('tx-power', '27'));
 // Web UI saves this as "max-hop-count"; accept both spellings so the UI setting
 // actually takes effect (previously only 'max-hop' was read → always 1 hop).
 const MAX_HOP = parseInt(cfg('max-hop-count', cfg('max-hop', '1')));
+// Multi-hop downlink timing compensation: the border derives the mesh-DL delay
+// from ITS OWN receive tmst of the mesh uplink, which is later than the
+// first-hop relay's receive tmst by the mesh multi-hop forwarding time.
+// Add a per-hop estimate (ms) so the addressed relay still transmits inside the
+// sensor's RX window. Semtech-UDP backend only; ChirpStack MQTT delay is
+// relative to the uplink and needs no compensation.
+const MESH_HOP_MS = parseInt(cfg('mesh-hop-ms', '200'));
 // LoRaWAN JoinAccept RX1 delay (seconds). NS schedules the JoinAccept at
 // uplink_tmst + JOIN_DELAY, so we use it to index pending JoinRequests.
 const JOIN_DELAY = parseInt(cfg('join-delay', '5'));
@@ -393,7 +401,7 @@ class MeshForwarder {
     this.dedup = new DedupCache();
     this.lastPullToken = 0;
     this.lastPullAddr = null;
-    this.stats = { rx: 0, sensor: 0, meshIn: 0, meshTx: 0, unwrap: 0, fwd: 0, dedup: 0, dlRx: 0, dlTx: 0, dlDirect: 0, ignoredDirect: 0, hbTx: 0, hbRx: 0 };
+    this.stats = { rx: 0, sensor: 0, meshIn: 0, meshTx: 0, unwrap: 0, fwd: 0, dedup: 0, dlRx: 0, dlTx: 0, dlDirect: 0, dlRelay: 0, ignoredDirect: 0, hbTx: 0, hbRx: 0 };
     this.dlCtx = new DlCtxCache();
     this.uplinkTmst = new Map(); // relay: deviceKey → concentrator tmst
     this.lastRelay = null; // { relayId, uid, dr, tmst } — fallback for downlink routing
@@ -435,7 +443,7 @@ class MeshForwarder {
     setInterval(() => {
       const s = this.stats;
       const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
-      console.log(`[${ts}] Stats: rx=${s.rx} sensor=${s.sensor} mesh_in=${s.meshIn} tx=${s.meshTx} unwrap=${s.unwrap} fwd=${s.fwd} dedup=${s.dedup} dl_rx=${s.dlRx} dl_tx=${s.dlTx} dl_dir=${s.dlDirect} ign=${s.ignoredDirect} hb_tx=${s.hbTx} hb_rx=${s.hbRx}`);
+      console.log(`[${ts}] Stats: rx=${s.rx} sensor=${s.sensor} mesh_in=${s.meshIn} tx=${s.meshTx} unwrap=${s.unwrap} fwd=${s.fwd} dedup=${s.dedup} dl_rx=${s.dlRx} dl_tx=${s.dlTx} dl_dir=${s.dlDirect} dl_rly=${s.dlRelay} ign=${s.ignoredDirect} hb_tx=${s.hbTx} hb_rx=${s.hbRx}`);
       // MQTT backend: report gateway stats so NS tracks gateway online state.
       if (BACKEND === 'mqtt' && ROLE === 'border' && this.mqttClient && this.mqttClient.connected) {
         const gwId = this.gwId ? this.gwId.toString('hex') : '';
@@ -654,7 +662,7 @@ class MeshForwarder {
       return;
     }
 
-    // ── Downlink handling (relay only) ──
+    // ── Downlink handling (relay only, multi-hop) ──
     if (payloadType === 1) {
       if (ROLE !== 'relay') return;
       if (phy.length < 15) return; // MHDR(1)+meta(6)+relay(4)+phy(1)+MIC(4)
@@ -662,14 +670,37 @@ class MeshForwarder {
       const expectedMic = computeMic(SIGNING_KEY, frameNoMic);
       if (!phy.slice(-4).equals(expectedMic)) return; // bad MIC
       const relayId = phy.slice(7, 11);
-      if (!this.relayId || !relayId.equals(this.relayId)) return; // not for us
-      const originalPhy = phy.slice(11, -4);
       const hopCount = (mhdr & 0x07) + 1;
-      const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
-
-      // Extract DownlinkMetadata: uid(12bit)+dr(4bit) | freq/100(24bit) | power(4bit)+delay(4bit)
       const meta = phy.slice(1, 7);
       const dlUid = ((meta[0] << 8) | meta[1]) >> 4;
+      const ts = new Date().toISOString().replace('T',' ').replace(/\.\d+Z/,'');
+
+      // Multi-hop: mesh downlink frames are broadcast on the mesh channel, so
+      // dedup the (relayId, uplink uid) pair — each relay handles a frame exactly
+      // once, which also cuts broadcast loops. 'dl:' prefix keeps this out of the
+      // uplink dedup key space (same uid+relayId appears once per uplink AND once
+      // per downlink; a shared cache would drop the second).
+      const dlKey = `dl:${relayId.toString('hex')}:${dlUid}`;
+      if (!this.dedup.add(dlKey)) return;
+
+      // Not addressed to us → relay onward (hop+1, re-signed) up to MAX_HOP.
+      if (!this.relayId || !relayId.equals(this.relayId)) {
+        if (hopCount >= MAX_HOP) {
+          console.log(`[${ts}] DL DROP relay=${relayId.toString('hex')} uid=${dlUid} hop=${hopCount} >= max=${MAX_HOP}`);
+          return;
+        }
+        const newMhdr = (MTYPE_PROP << 5) | (1 << 3) | hopCount; // hop stored as N-1
+        const newFrame = Buffer.concat([Buffer.from([newMhdr]), phy.slice(1, -4)]);
+        const newMic = computeMic(SIGNING_KEY, newFrame);
+        this._txPullResp(Buffer.concat([newFrame, newMic]));
+        this.stats.dlRelay++;
+        console.log(`[${ts}] DL RELAY relay=${relayId.toString('hex')} uid=${dlUid} hop=${hopCount}->${hopCount+1} ${phy.length}B -> mesh`);
+        return;
+      }
+
+      const originalPhy = phy.slice(11, -4);
+
+      // Extract DownlinkMetadata: uid(12bit)+dr(4bit) | freq/100(24bit) | power(4bit)+delay(4bit)
       const dr = meta[1] & 0x0F;
       const dlFreq = (meta[2] << 16 | meta[3] << 8 | meta[4]) * 100;
       const dlPower = meta[5] >> 4;
@@ -758,6 +789,7 @@ class MeshForwarder {
           uid: meta.uid,
           dr: meta.dr,
           tmst: rxpk.tmst || 0,
+          hop: hopCount, // mesh hops the uplink travelled → downlink timing compensation
         });
       }
       // Always update lastRelay (fallback for JoinAccept where DevAddr key ≠ JoinRequest DevEUI key)
@@ -766,6 +798,7 @@ class MeshForwarder {
         uid: meta.uid,
         dr: meta.dr,
         tmst: rxpk.tmst || 0,
+        hop: hopCount,
       };
       // Track JoinRequests separately so a later JoinAccept can derive the RX
       // delay from the NS downlink tmst instead of hardcoding it.
@@ -778,13 +811,14 @@ class MeshForwarder {
           dr: meta.dr,
           tmst: jrTmst,
           wallMs: Date.now(),
+          hop: hopCount,
         };
         // Index by the downlink tmst the NS will use for this JoinRequest's
         // JoinAccept: NS sends JoinAccept with tmst = uplink_tmst + JOIN_DELAY.
         // Multiple sensors may join concurrently, so key on the unique tmst
         // (not "last JoinRequest") to match the right one later.
         const expTmst = ((jrTmst + JOIN_DELAY * 1e6) >>> 0);
-        this.joinReqs.push({ expTmst, tmst: jrTmst, relayId: Buffer.from(relayId), uid: meta.uid, dr: meta.dr, wallMs: Date.now() });
+        this.joinReqs.push({ expTmst, tmst: jrTmst, relayId: Buffer.from(relayId), uid: meta.uid, dr: meta.dr, wallMs: Date.now(), hop: hopCount });
         // Prune entries older than 60s
         const cutoff = Date.now() - 60000;
         this.joinReqs = this.joinReqs.filter(j => j.wallMs > cutoff);
@@ -1033,7 +1067,7 @@ class MeshForwarder {
         if (d < bestDiff) { bestDiff = d; best = j; }
       }
       if (best && bestDiff <= 2e6) { // within 2s counts as a match
-        ctx = { relayId: best.relayId, uid: best.uid, dr: best.dr, tmst: best.tmst };
+        ctx = { relayId: best.relayId, uid: best.uid, dr: best.dr, tmst: best.tmst, hop: best.hop || 0 };
         console.log(`  JoinAccept matched JoinReq by tmst (uid=${best.uid}, diff=${bestDiff}us, joinReqs=${this.joinReqs.length})`);
       }
     }
@@ -1064,9 +1098,13 @@ class MeshForwarder {
     } else if (!imme && ctx && tmst && ctx.tmst) {
       let diff = tmst - ctx.tmst;
       if (diff < 0) diff += 0x100000000; // 32-bit concentrator counter wrap
-      delaySec = Math.round(diff / 1e6);
+      // ctx.tmst is the BORDER's receive tmst of the mesh uplink, which is later
+      // than the first-hop relay's own receive tmst by the mesh forwarding time.
+      // Add (hops-1)*MESH_HOP_MS so the relay still hits the sensor's RX window.
+      const hopComp = ((ctx.hop || 1) - 1) * MESH_HOP_MS * 1e3;
+      delaySec = Math.round((diff + hopComp) / 1e6);
       delaySec = Math.max(1, Math.min(15, delaySec));
-      console.log(`  RX delay derived: tmst=${tmst} uplinkTmst=${ctx.tmst} -> ${delaySec}s`);
+      console.log(`  RX delay derived: tmst=${tmst} uplinkTmst=${ctx.tmst} hop=${ctx.hop||1} +${Math.round(hopComp/1e6)}s comp -> ${delaySec}s`);
     } else if (!imme) {
       // No timing info to derive from — cannot schedule a timed downlink.
       console.log(`  WARN: timed downlink without tmst/ctx, cannot schedule (devKey=${devKey||'?'})`);

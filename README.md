@@ -42,7 +42,7 @@
 - 所有网关在 mesh 频点（如 US915 `903.9/904.1/904.3 MHz`）上监听同一信道
 - **上行洪泛**：relay 包好 mesh 帧广播；中间 relay 收到后把 MHDR 的 hop 字段 +1、重算 MIC 重广播，到 `max-hop-count` 停；border 收到即终止
 - **去重**：key = `uid:relayId`（uid 是 relay 侧 12-bit 递增计数），防环；`relayId == 自己` 的自环帧直接丢
-- **下行是单跳**：mesh 下行帧只带目标 `relayId`，只有匹配的 relay 发射，中间 relay 直接丢弃（当前不支持下行多跳，mesh 下行帧里没有 hop 转发逻辑）
+- **下行多跳**：mesh 下行帧带目标 `relayId`（第一跳 relay）。不匹配的 relay 把 hop +1、重签 MIC 再广播，直到目标 relay 匹配后直发传感器；跳数到 `max-hop-count` 丢弃。帧级去重（key = `dl:relayId:uid`，前缀 `dl:` 与上行去重空间隔离）切断广播环
 - **心跳组网**：relay 每 `heartbeat-interval` 发一个 Event/heartbeat 帧，中间 relay 把自己的 `{relay_id, rssi, snr}` 追加到 `relay_path`，border 缓存拓扑写 `/opt/chirpstack/mesh_topo.json`（Web UI 拓扑卡片）。心跳只用于监控，**不参与下行选路**
 
 ### 怎么认出是哪个 relay 的包
@@ -74,11 +74,13 @@ border 直接收到的普通传感器帧（非 mesh）：`border-ignore-direct=t
 
 1. 每次 unwrap 上行时，border 按设备 key 记下 `device → {relayId, uid, dr, tmst}`（`dlCtx`）
 2. NS 下行进 `_handleTxpk`：
-   - **查得到 ctx（设备走过 mesh）→ 组 mesh 下行帧**：meta 6 字节带 `ctx.relayId + uid + freq + power + delay`，PULL_RESP 给本地 pkt_fwd 在 mesh 频点广播。目标 relay 收到后 `relayId == 自己` 才按 meta 的 freq/dr/`上行tmst+delay` 精确发射给传感器
+   - **查得到 ctx（设备走过 mesh）→ 组 mesh 下行帧**：meta 6 字节带 `ctx.relayId + uid + freq + power + delay`，PULL_RESP 给本地 pkt_fwd 在 mesh 频点广播。中间 relay（relayId 不匹配）hop+1 重广播；目标 relay `relayId == 自己` 才按 meta 的 freq/dr/`上行tmst+delay` 精确发射给传感器
    - **查不到 ctx（设备直连 border）→ 本机直发**：原帧按 NS 给的 freq/datr 直接 PULL_RESP 射频发出
 3. JoinAccept 特殊处理：JoinAccept 的 key（DevAddr）和 JoinRequest 的 key（DevEUI）对不上，border 用 NS 下行 `tmst` 精确匹配 `joinReqs[]`（`expTmst = 上行tmst + join-delay`），匹配不到再 fallback 最近一次 JoinRequest
 
 下行 delay 不硬编码：`imme=true`（Class C）→ delay=0 立即发；`imme=false` → delay = NS 下行 tmst − 上行 tmst（border 本地时基差值，时钟无关），或 ChirpStack MQTT 下行的相对延迟（如 `"1s"`）。relay 端用 `ulTmstMap[uid]` 查回精确上行 tmst。
+
+**多跳时序补偿**：border 推导 delay 用的是**自己收到 mesh 帧的 tmst**，比第一跳 relay 的上行 tmst 晚一个多跳转发时间。border 在 delay 里按 `(hop-1) × mesh-hop-ms` 补偿，目标 relay 才不会发得太早错过传感器 RX 窗口。Semtech UDP backend 需要此补偿；ChirpStack MQTT 的 delay 是相对上行的，天然准。
 
 ## 目录
 
@@ -136,6 +138,7 @@ sh /tmp/mesh_uninstall.sh
   "server-host": "127.0.0.1",
   "server-port": "1710",
   "max-hop-count": "1",
+  "mesh-hop-ms": "200",
   "join-delay": "5"
 }
 ```
@@ -143,6 +146,8 @@ sh /tmp/mesh_uninstall.sh
 - `signing-key` 两端必须一致，否则 Border 丢弃签名校验失败的帧
 - `tx-power` US915/AU915 建议 27（≥18 dBm 才启用外部 PA）
 - `backend=mqtt` 时 `server-host`/`server-port` 不生效，需配 `mqtt-server`/`mqtt-username`/`mqtt-password`/`mqtt-prefix`
+- `max-hop-count` 多跳时设 >1（上行洪泛和下行转发都受此限制，默认 1 即单跳）
+- `mesh-hop-ms` 下行多跳时序补偿，每跳转发耗时估计（默认 200ms；Semtech UDP backend 用，MQTT backend 无需）
 - Web UI Config 页的角色 / 协议 / 心跳等修改实时写回此文件
 
 ## 历史
